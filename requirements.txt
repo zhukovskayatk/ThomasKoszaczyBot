@@ -4,6 +4,10 @@ aiogram>=3.4.1,<4.0
 # Асинхронная ORM для работы с БД
 SQLAlchemy>=2.0.25
 
+# Нужна SQLAlchemy для работы асинхронных сессий (без неё — ошибка
+# "the greenlet library is required to use this function")
+greenlet>=3.0.0
+
 # Асинхронный драйвер для SQLite (используется SQLAlchemy "под капотом")
 aiosqlite>=0.19.0
 

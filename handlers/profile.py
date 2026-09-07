@@ -8,10 +8,9 @@
 ::get_streak_status / rescue_streak_with_xp).
 
 Под карточкой — отдельным сообщением кнопка "🔔 Уведомления", ведущая на
-экран пяти переключателей (утренний чек-лист в 09:00, напоминания по
-задачам, тихие часы 22:00–08:00, утренний/вечерний пуш чек-листа дня, см.
-notif_open/notif_toggle ниже и services/scheduler.py, где эти настройки
-реально применяются).
+экран трёх переключателей (утренний чек-лист в 09:00, напоминания по
+задачам, тихие часы 22:00–08:00, см. notif_open/notif_toggle ниже и
+services/scheduler.py, где эти настройки реально применяются).
 """
 
 from aiogram import F, Router
@@ -132,7 +131,7 @@ async def streak_rescue(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "notif_open")
 async def notif_open(callback: CallbackQuery) -> None:
-    """Кнопка "🔔 Уведомления" под карточкой профиля — открывает экран пяти
+    """Кнопка "🔔 Уведомления" под карточкой профиля — открывает экран трёх
     переключателей (см. keyboards.notification_settings_keyboard)."""
     user = await get_or_create_user(
         user_id=callback.from_user.id,

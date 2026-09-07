@@ -457,4 +457,856 @@ async def add_task_from_text(message: Message) -> None:
         reminders = await get_task_reminders(pending_task_id)
         await message.answer(
             "✅ Текст обновлён!\n\n" + texts.task_card_text(task, reminders),
-            reply_markup=task_card_keyboard(pending_task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup
+            reply_markup=task_card_keyboard(pending_task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        )
+        return
+
+    task = await add_task(user_id=user_id, title=message.text)
+    await confirm_task_added(message, task)
+
+
+# --- Обработка нажатия на кнопку приоритета (🟢/🟡/🔴) -------------------------
+
+@router.callback_query(F.data.startswith("prio:"))
+async def process_priority_choice(callback: CallbackQuery) -> None:
+    _, task_id_str, priority_value = callback.data.split(":", maxsplit=2)
+    task_id = int(task_id_str)
+    priority = Priority(priority_value)
+
+    success = await set_task_priority(
+        task_id=task_id, user_id=callback.from_user.id, priority=priority
+    )
+
+    if not success:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Приоритет сохранён ✅")
+
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        return
+
+    # Приоритет выбран — переходим к следующему шагу мастера: экран быстрых
+    # пресетов срока (Сегодня/Завтра/на выходных/на неделе), а не сразу
+    # календарь — для большинства задач точная дата не нужна (см. модуль
+    # дедлайнов и напоминаний ниже). Кнопки 🟢/🟡/🔴 своё дело сделали, не
+    # передаём reply_markup от них — deadline_presets_keyboard заменит их
+    # в этом же сообщении.
+    await callback.message.edit_text(
+        texts.deadline_presets_prompt_text(task.title),
+        reply_markup=deadline_presets_keyboard(CTX_NEW, task_id).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("prio_cancel:"))
+async def prio_cancel(callback: CallbackQuery) -> None:
+    """
+    "❌ Отмена" сразу после создания задачи (пока не выбран даже приоритет).
+    На этом шаге в БД есть только название задачи и ничего больше — отмена
+    здесь просто удаляет её целиком, как будто её и не создавали.
+    """
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    await delete_task(task_id=task_id, user_id=callback.from_user.id)
+    await callback.answer("Отменено, ничего не сохранил")
+    await callback.message.edit_text("❌ Создание задачи отменено.")
+
+
+# --- Time Management Module: декоративные/неактивные кнопки -------------------
+
+@router.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery) -> None:
+    # Заголовки, шапка дней недели, пустые клетки сетки, прошедшие дни,
+    # заблокированная "◀️", текущие значения часов/минут по центру
+    # барабана времени — все они используют этот же callback_data, просто
+    # чтобы Telegram не показывал бесконечный "часики" при нажатии на
+    # декоративную кнопку.
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wiz_cancel:"))
+async def wiz_cancel(callback: CallbackQuery) -> None:
+    """
+    "❌ Отмена" на экранах календаря и селектора времени (общая для обоих —
+    в этот момент ни один из них ещё ничего не сохранил, дедлайн/новое
+    время фиксируются только по явному подтверждению). Поведение зависит
+    от контекста:
+    - CTX_NEW: дедлайн ещё не сохранён — отмена равносильна "⚪️ Без срока",
+      задача остаётся как есть (её всегда можно доредактировать из карточки).
+    - CTX_EDIT: просто возвращаемся на карточку задачи, ничего не меняя.
+    - CTX_SNOOZE: возвращаемся к исходному уведомлению — как и "◀️ Отмена"
+      в меню "💤 Отложить".
+    """
+    _, context, entity_id_str = callback.data.split(":", maxsplit=2)
+    entity_id = int(entity_id_str)
+
+    if context == CTX_SNOOZE:
+        reminder_id = entity_id
+        found = await get_reminder_with_task(reminder_id)
+        if found is None:
+            await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
+            return
+        reminder, task = found
+        await callback.answer("Отменено")
+        await _finish_wizard(
+            callback,
+            texts.reminder_notification_text(task, reminder.offset),
+            reminder_notification_keyboard(reminder_id, task).as_markup(),
+        )
+        return
+
+    task_id, user_id = entity_id, callback.from_user.id
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    if context == CTX_NEW:
+        await callback.answer("Ок, без дедлайна")
+        await _finish_wizard(callback, texts.deadline_saved_text(task.title, task.priority, None))
+        return
+
+    # CTX_EDIT — возвращаемся на карточку задачи без изменений.
+    await callback.answer("Отменено")
+    reminders = await get_task_reminders(task_id)
+    await _finish_wizard(
+        callback,
+        texts.task_card_text(task, reminders),
+        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+    )
+
+
+# --- Time Management Module: экран быстрых пресетов срока ---------------------
+
+def _resolve_preset_date(code: str) -> date:
+    """
+    Переводит код быстрого пресета (см. keyboards.deadline_presets_keyboard)
+    в конкретную дату:
+    - today/tomorrow — буквально сегодня/завтра;
+    - weekend — ближайшая суббота; если сегодня уже суббота или
+      воскресенье — само сегодня (иначе "на выходных" улетало бы на
+      следующую неделю, если открыть бота уже в выходной день);
+    - week — конец текущей недели (воскресенье), включая сегодня, если
+      сегодня уже воскресенье.
+    """
+    today = date.today()
+    weekday = today.weekday()  # Пн=0 ... Вс=6
+
+    if code == "tomorrow":
+        return today + timedelta(days=1)
+    if code == "weekend":
+        if weekday >= 5:
+            return today
+        return today + timedelta(days=5 - weekday)
+    if code == "week":
+        return today + timedelta(days=6 - weekday)
+    return today  # code == "today" (и любой неизвестный код — безопасный дефолт)
+
+
+@router.callback_query(F.data.startswith("cal_open:"))
+async def cal_open(callback: CallbackQuery) -> None:
+    """Кнопка "🗓 Выбрать в календаре..." на экране быстрых пресетов —
+    открывает обычный интерактивный календарь (см. deadline_presets_keyboard)."""
+    _, context, entity_id_str = callback.data.split(":", maxsplit=2)
+    task_id = int(entity_id_str)
+
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer()
+    today = date.today()
+    await callback.message.edit_text(
+        texts.deadline_prompt_text(task.title),
+        reply_markup=calendar_keyboard(context, task_id, today.year, today.month).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("preset_day:"))
+async def preset_day(callback: CallbackQuery) -> None:
+    """
+    Клик по одному из быстрых пресетов ("📍 Сегодня", "🌅 Завтра" и т.п.) —
+    сразу переходит к шагу выбора времени (тот же экран, что и после клика
+    по конкретному дню в обычном календаре, см. cal_day), без промежуточного
+    открытия самого календаря.
+    """
+    _, context, entity_id_str, code = callback.data.split(":", maxsplit=3)
+    task_id = int(entity_id_str)
+
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    target_date = _resolve_preset_date(code)
+    await callback.answer()
+    default_hour, default_minute = _default_time_for_date(target_date.year, target_date.month, target_date.day)
+    await callback.message.edit_text(
+        texts.time_prompt_text(task.title, target_date.day, target_date.month, target_date.year),
+        reply_markup=time_drum_keyboard(
+            context, task_id, target_date.year, target_date.month, target_date.day, default_hour, default_minute
+        ).as_markup(),
+    )
+
+
+# --- Time Management Module: шаг 1 — инлайн-календарь --------------------------
+
+@router.callback_query(F.data.startswith("cal_nav:"))
+async def cal_nav(callback: CallbackQuery) -> None:
+    _, context, entity_id_str, year_str, month_str, direction = callback.data.split(":", maxsplit=5)
+    year, month = shift_month(int(year_str), int(month_str), direction)
+
+    keyboard = calendar_keyboard(context, int(entity_id_str), year, month)
+    await callback.message.edit_reply_markup(reply_markup=keyboard.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cal_day:"))
+async def cal_day(callback: CallbackQuery) -> None:
+    _, context, entity_id_str, year_str, month_str, day_str = callback.data.split(":", maxsplit=5)
+    entity_id, year, month, day = int(entity_id_str), int(year_str), int(month_str), int(day_str)
+
+    if context == CTX_SNOOZE:
+        # entity_id здесь — reminder_id, не task_id.
+        found = await get_reminder_with_task(entity_id)
+        if found is None:
+            await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
+            return
+        title = found[1].title
+    else:
+        task = await get_task(task_id=entity_id, user_id=callback.from_user.id)
+        if task is None:
+            await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+            return
+        title = task.title
+
+    await callback.answer()
+    default_hour, default_minute = _default_time_for_date(year, month, day)
+    await callback.message.edit_text(
+        texts.time_prompt_text(title, day, month, year),
+        reply_markup=time_drum_keyboard(
+            context, entity_id, year, month, day, default_hour, default_minute
+        ).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("cal_none:"))
+async def cal_none(callback: CallbackQuery) -> None:
+    """Кнопка "⚪️ Без срока" — задача сразу сохраняется без срока и без
+    напоминаний, шаги времени/напоминаний пропускаются целиком."""
+    _, context, entity_id_str = callback.data.split(":", maxsplit=2)
+
+    if context == CTX_SNOOZE:
+        # Календарь в контексте переноса напоминания эту кнопку вообще не
+        # показывает — сюда почти невозможно попасть, но на всякий случай.
+        await callback.answer("Недоступно для переноса напоминания", show_alert=True)
+        return
+
+    task_id, user_id = int(entity_id_str), callback.from_user.id
+
+    await set_task_deadline(task_id=task_id, user_id=user_id, deadline=None, all_day=False)
+    await clear_task_reminders(task_id)
+    scheduler_service.unschedule_all_for_task(task_id)
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Сохранено без срока")
+
+    if context == CTX_NEW:
+        await _finish_wizard(callback, texts.deadline_saved_text(task.title, task.priority, None))
+    else:  # CTX_EDIT — возвращаемся на карточку задачи
+        reminders = await get_task_reminders(task_id)
+        await _finish_wizard(
+            callback,
+            texts.task_card_text(task, reminders),
+            task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        )
+
+
+async def _save_all_day_deadline(
+    callback: CallbackQuery, context: str, task_id: int, target_date: date
+) -> None:
+    """
+    Общая логика для обеих кнопок "☀️ В течение дня" — календарной (всегда
+    сегодня, cal_allday) и той, что появляется уже на экране барабана
+    времени для ЛЮБОЙ выбранной даты (td_allday).
+
+    Раньше этот шаг сразу сохранял задачу и ПОЛНОСТЬЮ пропускал шаг
+    напоминаний (раз точного часа нет) — из-за этого дедлайн "сегодня, без
+    часа" сохранялся молча, без единого шанса поставить напоминание, хотя
+    дедлайн всё равно наступает именно в этот день и напомнить о нём не
+    менее важно, чем о задаче с точным временем (это и была жалоба —
+    бот "забывал" спросить про уведомления для дел без точного часа).
+    Теперь шаг напоминаний показывается точно так же, как и после выбора
+    точного времени (см. td_confirm) — дедлайн просто хранится как конец
+    этого дня (23:59), поэтому смещения вроде "За 1 день"/"За 3 дня"
+    отсчитываются от конца дня, а не от конкретного часа.
+    """
+    user_id = callback.from_user.id
+    deadline = datetime.combine(target_date, datetime.max.time().replace(microsecond=0))
+
+    await set_task_deadline(task_id=task_id, user_id=user_id, deadline=deadline, all_day=True)
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Сохранено без точного часа")
+
+    if context == CTX_NEW:
+        # Новая задача — напоминаний по ней ещё физически не может быть,
+        # просто показываем шаг их выбора (см. td_confirm/CTX_NEW).
+        available_offsets = available_reminder_offsets(deadline)
+        await callback.message.edit_text(
+            texts.reminders_prompt_text(task.title, deadline, all_day=True),
+            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets=set()).as_markup(),
+        )
+        return
+
+    # CTX_EDIT — дедлайн уже существующей задачи поменялся на "без часа":
+    # пересчитываем уже выбранные напоминания под новый дедлайн (23:59
+    # этого дня), а не сбрасываем их молча — так же, как и при правке
+    # точного времени (см. td_confirm/CTX_EDIT).
+    kept, removed_offsets = await recompute_reminders_for_new_deadline(task_id, deadline)
+    for offset in removed_offsets:
+        scheduler_service.unschedule_reminder(task_id, offset)
+    for reminder in kept:
+        await scheduler_service.schedule_reminder(task_id, reminder.offset, reminder.reminder_id, reminder.remind_at)
+
+    reminders = await get_task_reminders(task_id)
+    await _finish_wizard(
+        callback,
+        texts.task_card_text(task, reminders),
+        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("cal_allday:"))
+async def cal_allday(callback: CallbackQuery) -> None:
+    """Кнопка "☀️ В течение дня" в календаре — быстрый срок "сегодня, без
+    конкретного часа" (независимо от того, какой месяц сейчас пролистан)."""
+    _, context, entity_id_str = callback.data.split(":", maxsplit=2)
+
+    if context == CTX_SNOOZE:
+        await callback.answer("Недоступно для переноса напоминания", show_alert=True)
+        return
+
+    await _save_all_day_deadline(callback, context, int(entity_id_str), date.today())
+
+
+@router.callback_query(F.data.startswith("td_allday:"))
+async def td_allday(callback: CallbackQuery) -> None:
+    """Кнопка "☀️ В течение дня" на экране барабана времени — то же самое,
+    но для ДАТЫ, уже выбранной на предыдущем шаге (любой, не только сегодня)."""
+    _, context, entity_id_str, year_str, month_str, day_str = callback.data.split(":", maxsplit=5)
+
+    if context == CTX_SNOOZE:
+        await callback.answer("Недоступно для переноса напоминания", show_alert=True)
+        return
+
+    target_date = date(int(year_str), int(month_str), int(day_str))
+    await _save_all_day_deadline(callback, context, int(entity_id_str), target_date)
+
+
+# --- Time Management Module: шаг 2 — барабан времени ----------------------------
+
+@router.callback_query(F.data.startswith("td_pick:"))
+async def td_pick(callback: CallbackQuery) -> None:
+    """Клик по стрелке ▲/▼ или по соседнему значению на барабане — сразу
+    переносит барабан на него, само подтверждение — отдельным явным шагом."""
+    _, context, entity_id_str, year_str, month_str, day_str, hour_str, minute_str = (
+        callback.data.split(":", maxsplit=7)
+    )
+    entity_id, year, month, day = int(entity_id_str), int(year_str), int(month_str), int(day_str)
+    hour, minute = int(hour_str), int(minute_str)
+
+    keyboard = time_drum_keyboard(context, entity_id, year, month, day, hour, minute)
+    await callback.message.edit_reply_markup(reply_markup=keyboard.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("td_confirm:"))
+async def td_confirm(callback: CallbackQuery) -> None:
+    """
+    Явное подтверждение времени. Поведение зависит от контекста:
+    - CTX_SNOOZE: entity_id — reminder_id, просто переносим ЭТО напоминание
+      на выбранные дату/время и возвращаем короткое подтверждение.
+    - CTX_NEW: сохраняет дедлайн новой задачи и переходит к следующему шагу
+      мастера — мультивыбору напоминаний.
+    - CTX_EDIT: сохраняет новый дедлайн уже существующей задачи, пересчитывает
+      под него уже выбранные напоминания и возвращает карточку задачи.
+    """
+    _, context, entity_id_str, year_str, month_str, day_str, hour_str, minute_str = (
+        callback.data.split(":", maxsplit=7)
+    )
+    entity_id, year, month, day = int(entity_id_str), int(year_str), int(month_str), int(day_str)
+    hour, minute = int(hour_str), int(minute_str)
+    chosen = datetime(year, month, day, hour, minute)
+
+    if chosen <= datetime.now():
+        await callback.answer("Это время уже прошло — выбери время в будущем 🙂", show_alert=True)
+        return
+
+    if context == CTX_SNOOZE:
+        reminder_id = entity_id
+        ok = await scheduler_service.reschedule(reminder_id, chosen)
+        if not ok:
+            await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
+            return
+        await callback.answer("Перенесено ✅")
+        await _finish_wizard(callback, texts.snooze_confirmed_text(chosen))
+        return
+
+    task_id, user_id = entity_id, callback.from_user.id
+
+    if context == CTX_NEW:
+        await set_task_deadline(task_id=task_id, user_id=user_id, deadline=chosen, all_day=False)
+        task = await get_task(task_id=task_id, user_id=user_id)
+        if task is None:
+            await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+            return
+
+        await callback.answer("Дедлайн сохранён ✅")
+        available_offsets = available_reminder_offsets(chosen)
+        await callback.message.edit_text(
+            texts.reminders_prompt_text(task.title, chosen),
+            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets=set()).as_markup(),
+        )
+        return
+
+    # CTX_EDIT — правка даты/времени уже существующей задачи из карточки.
+    await set_task_deadline(task_id=task_id, user_id=user_id, deadline=chosen, all_day=False)
+    kept, removed_offsets = await recompute_reminders_for_new_deadline(task_id, chosen)
+
+    for offset in removed_offsets:
+        scheduler_service.unschedule_reminder(task_id, offset)
+    for reminder in kept:
+        await scheduler_service.schedule_reminder(task_id, reminder.offset, reminder.reminder_id, reminder.remind_at)
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Дедлайн обновлён ✅")
+    reminders = await get_task_reminders(task_id)
+    await _finish_wizard(
+        callback,
+        texts.task_card_text(task, reminders),
+        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+    )
+
+
+# --- Time Management Module: шаг 3 — мультивыбор напоминаний -------------------
+
+@router.callback_query(F.data.startswith("rmd_toggle:"))
+async def rmd_toggle(callback: CallbackQuery) -> None:
+    """
+    Переключает один чекбокс напоминания (◻️ ↔ ☑️) ПРЯМО в этом же
+    сообщении через edit_message_reply_markup — без спама новыми
+    сообщениями. Каждая отмеченная галочка сразу же создаёт запись в БД
+    и таймер в планировщике (а не откладывается до кнопки "Сохранить") —
+    так надёжнее: если человек просто закроет чат посередине настройки,
+    уже выбранные напоминания не потеряются.
+    """
+    _, context, task_id_str, offset_value = callback.data.split(":", maxsplit=3)
+    task_id = int(task_id_str)
+    offset = ReminderOffset(offset_value)
+    user_id = callback.from_user.id
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None or task.deadline is None:
+        await callback.answer("Сначала нужен дедлайн 🤔", show_alert=True)
+        return
+
+    current_offsets = {reminder.offset for reminder in await get_task_reminders(task_id)}
+
+    if offset in current_offsets:
+        removed = await remove_reminder(task_id, offset)
+        if removed:
+            scheduler_service.unschedule_reminder(task_id, offset)
+        await callback.answer("Убрано")
+    else:
+        remind_at = task.deadline - REMINDER_OFFSET_DELTAS[offset]
+        if remind_at <= datetime.now():
+            await callback.answer(
+                "Это напоминание сработало бы уже в прошлом — выбери другое 🙂",
+                show_alert=True,
+            )
+            return
+
+        reminder = await add_reminder(task_id, offset, remind_at)
+        await scheduler_service.schedule_reminder(task_id, offset, reminder.reminder_id, remind_at)
+        await callback.answer("Добавлено ✅")
+
+    updated_offsets = {reminder.offset for reminder in await get_task_reminders(task_id)}
+    # Пересчитываем доступные варианты заново — время идёт, и пока
+    # человек тыкает чекбоксы, какой-то из ранее доступных вариантов мог
+    # физически "протухнуть" (см. database.requests.available_reminder_offsets).
+    offsets_available_now = available_reminder_offsets(task.deadline)
+    keyboard = reminders_keyboard(context, task_id, offsets_available_now, updated_offsets)
+    await callback.message.edit_reply_markup(reply_markup=keyboard.as_markup())
+
+
+@router.callback_query(F.data.startswith("rmd_clear:"))
+async def rmd_clear(callback: CallbackQuery) -> None:
+    """Кнопка "🔕 Без напоминаний" — снимает разом все уже выбранные галочки."""
+    _, context, task_id_str = callback.data.split(":", maxsplit=2)
+    task_id = int(task_id_str)
+
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+
+    await clear_task_reminders(task_id)
+    scheduler_service.unschedule_all_for_task(task_id)
+
+    await callback.answer("Напоминания отключены 🔕")
+    offsets_available_now = available_reminder_offsets(task.deadline) if task and task.deadline else []
+    keyboard = reminders_keyboard(context, task_id, offsets_available_now, set())
+    await callback.message.edit_reply_markup(reply_markup=keyboard.as_markup())
+
+
+@router.callback_query(F.data.startswith("rmd_done:"))
+async def rmd_done(callback: CallbackQuery) -> None:
+    """Кнопка "💾 Готово к сохранению" — завершает шаг напоминаний. Для CTX_NEW
+    (только что созданная задача) показывает финальную карточку, для
+    CTX_EDIT (правка напоминаний уже существующей задачи из её карточки)
+    возвращает саму карточку."""
+    _, context, task_id_str = callback.data.split(":", maxsplit=2)
+    task_id = int(task_id_str)
+
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Готово! 🎉")
+
+    if context == CTX_NEW:
+        await _finish_wizard(
+            callback,
+            texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day),
+        )
+        return
+
+    reminders = await get_task_reminders(task_id)
+    await _finish_wizard(
+        callback,
+        texts.task_card_text(task, reminders),
+        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+    )
+
+
+# --- Детальная карточка задачи (список → клик по задаче) ----------------------
+
+@router.callback_query(F.data.startswith("card_open:"))
+async def card_open(callback: CallbackQuery) -> None:
+    _, task_id_str, offset_str = callback.data.split(":", maxsplit=2)
+    task_id, offset = int(task_id_str), int(offset_str)
+
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    reminders = await get_task_reminders(task_id)
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.task_card_text(task, reminders),
+        reply_markup=task_card_keyboard(task_id, offset, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("card_edittext:"))
+async def card_edittext(callback: CallbackQuery) -> None:
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    _pending_rename[callback.from_user.id] = task_id
+    await callback.answer()
+    await callback.message.edit_text(
+        f"✏️ Пришли новый текст для задачи «{texts.escape(task.title)}» следующим сообщением 👇"
+    )
+
+
+@router.callback_query(F.data.startswith("card_editdl:"))
+async def card_editdl(callback: CallbackQuery) -> None:
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.deadline_presets_prompt_text(task.title),
+        reply_markup=deadline_presets_keyboard(CTX_EDIT, task_id).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("card_remind:"))
+async def card_remind(callback: CallbackQuery) -> None:
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+    if task.deadline is None:
+        await callback.answer("Сначала задай дату/время — кнопка «📅 Изменить дату / время» 🤔", show_alert=True)
+        return
+
+    await callback.answer()
+    current_offsets = {reminder.offset for reminder in await get_task_reminders(task_id)}
+    offsets_available_now = available_reminder_offsets(task.deadline)
+    await callback.message.edit_text(
+        texts.reminders_prompt_text(task.title, task.deadline, task.deadline_all_day),
+        reply_markup=reminders_keyboard(CTX_EDIT, task_id, offsets_available_now, current_offsets).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("card_chk_in:"))
+async def card_chk_in(callback: CallbackQuery) -> None:
+    """
+    Тумблер "☀️ Включить в Чек-лист дня" в карточке задачи — быстро
+    ставит дедлайн "сегодня, в течение дня" (без похода в мастер срока
+    целиком), задача сразу появляется на главном экране чек-листа. Если у
+    задачи уже был дедлайн (на другой день или с точным часом) — он
+    заменяется: тумблер именно про "сегодня", а не про сохранение старого
+    значения.
+    """
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    user_id = callback.from_user.id
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    today_end = datetime.combine(date.today(), datetime.max.time().replace(microsecond=0))
+    await set_task_deadline(task_id=task_id, user_id=user_id, deadline=today_end, all_day=True)
+
+    # Пересчитываем уже выбранные напоминания под новый дедлайн — та же
+    # логика, что и при обычной правке даты/времени из карточки (td_confirm).
+    kept, removed_offsets = await recompute_reminders_for_new_deadline(task_id, today_end)
+    for offset in removed_offsets:
+        scheduler_service.unschedule_reminder(task_id, offset)
+    for reminder in kept:
+        await scheduler_service.schedule_reminder(task_id, reminder.offset, reminder.reminder_id, reminder.remind_at)
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Добавлено в Чек-лист дня ☀️")
+    reminders = await get_task_reminders(task_id)
+    await callback.message.edit_text(
+        texts.task_card_text(task, reminders),
+        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=True).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("card_chk_out:"))
+async def card_chk_out(callback: CallbackQuery) -> None:
+    """
+    Тумблер "🌙 Убрать из Чек-листа дня" в карточке задачи — снимает
+    сегодняшний дедлайн целиком (та же операция, что и кнопка "⚪️ Без
+    срока" в календаре, и кнопка "🚫 Убрать из дня" в режиме настройки
+    чек-листа, см. handlers/checklist.py::chked_trm): задача НЕ удаляется,
+    просто возвращается в бэклог без срока.
+    """
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    user_id = callback.from_user.id
+
+    await set_task_deadline(task_id=task_id, user_id=user_id, deadline=None, all_day=False)
+    await clear_task_reminders(task_id)
+    scheduler_service.unschedule_all_for_task(task_id)
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Убрано из Чек-листа дня 🌙")
+    reminders = await get_task_reminders(task_id)
+    await callback.message.edit_text(
+        texts.task_card_text(task, reminders),
+        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=False).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("card_delete:"))
+async def card_delete(callback: CallbackQuery) -> None:
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        f"🗑 Точно удалить задачу «{texts.escape(task.title)}»? Это нельзя отменить.",
+        reply_markup=delete_confirm_keyboard(task_id).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("card_delyes:"))
+async def card_delyes(callback: CallbackQuery) -> None:
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    user_id = callback.from_user.id
+
+    scheduler_service.unschedule_all_for_task(task_id)
+    success = await delete_task(task_id=task_id, user_id=user_id)
+
+    if not success:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Удалено 🗑")
+    await callback.message.edit_text("🗑 Задача удалена.")
+
+
+@router.callback_query(F.data.startswith("card_delno:"))
+async def card_delno(callback: CallbackQuery) -> None:
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Отменено")
+    reminders = await get_task_reminders(task_id)
+    await callback.message.edit_text(
+        texts.task_card_text(task, reminders),
+        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+    )
+
+
+# --- Time Management Module: кнопки под пуш-уведомлением о напоминании --------
+
+@router.callback_query(F.data.startswith("remind_task_done:"))
+async def remind_task_done(callback: CallbackQuery) -> None:
+    """Кнопка "✅ Сделано! (+XP)" прямо под уведомлением-напоминанием —
+    переиспользует ту же логику закрытия задачи, что и накопительный
+    чек-ин "✅ Я сделал!"."""
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    if await complete_task(callback, task_id) is None:
+        return
+    # Реакция (награда) уже ушла отдельным сообщением внутри complete_task —
+    # здесь просто убираем кнопки с самого уведомления, чтобы нельзя было
+    # нажать повторно.
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+
+@router.callback_query(F.data.startswith("snz_menu:"))
+async def snz_menu(callback: CallbackQuery) -> None:
+    """Кнопка "💤 Отложить..." под уведомлением — открывает меню вариантов
+    переноса, подменяя клавиатуру ПРЯМО в этом же сообщении."""
+    _, reminder_id_str, task_id_str = callback.data.split(":", maxsplit=2)
+    reminder_id, task_id = int(reminder_id_str), int(task_id_str)
+
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=snooze_menu_keyboard(reminder_id, task_id).as_markup())
+
+
+@router.callback_query(F.data.startswith("snz_quick:"))
+async def snz_quick(callback: CallbackQuery) -> None:
+    """Быстрый перенос: +15 минут / +30 минут / +1 час / +3 часа от текущего момента."""
+    _, reminder_id_str, task_id_str, minutes_str = callback.data.split(":", maxsplit=3)
+    reminder_id, minutes = int(reminder_id_str), int(minutes_str)
+
+    new_time = datetime.now() + timedelta(minutes=minutes)
+    ok = await scheduler_service.reschedule(reminder_id, new_time)
+    if not ok:
+        await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
+        return
+
+    await callback.answer("Перенесено ⏰")
+    await callback.message.edit_text(texts.snooze_confirmed_text(new_time))
+
+
+@router.callback_query(F.data.startswith("snz_tmr:"))
+async def snz_tmr(callback: CallbackQuery) -> None:
+    """Перенос "на завтра утро (09:00)" / "на завтра вечер (18:00)"."""
+    _, reminder_id_str, task_id_str, hour_str, minute_str = callback.data.split(":", maxsplit=4)
+    reminder_id, hour, minute = int(reminder_id_str), int(hour_str), int(minute_str)
+
+    tomorrow = date.today() + timedelta(days=1)
+    new_time = datetime.combine(tomorrow, datetime.min.time()).replace(hour=hour, minute=minute)
+
+    ok = await scheduler_service.reschedule(reminder_id, new_time)
+    if not ok:
+        await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
+        return
+
+    await callback.answer("Перенесено ⏰")
+    await callback.message.edit_text(texts.snooze_confirmed_text(new_time))
+
+
+@router.callback_query(F.data.startswith("snz_custom:"))
+async def snz_custom(callback: CallbackQuery) -> None:
+    """"🗓 Выбрать новую дату и время" — открывает тот же календарь, что и
+    мастер создания задачи, но в контексте CTX_SNOOZE (переносит именно
+    это напоминание, а не дедлайн всей задачи)."""
+    _, reminder_id_str, task_id_str = callback.data.split(":", maxsplit=2)
+    reminder_id = int(reminder_id_str)
+
+    found = await get_reminder_with_task(reminder_id)
+    if found is None:
+        await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
+        return
+    _, task = found
+
+    await callback.answer()
+    today = date.today()
+    await callback.message.edit_text(
+        f"🗓 Выбери новую дату для напоминания про «{texts.escape(task.title)}»:",
+        reply_markup=calendar_keyboard(CTX_SNOOZE, reminder_id, today.year, today.month).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("snz_cancel:"))
+async def snz_cancel(callback: CallbackQuery) -> None:
+    """"◀️ Отмена" в меню "💤 Отложить" — возвращает исходное уведомление как было."""
+    _, reminder_id_str, task_id_str = callback.data.split(":", maxsplit=2)
+    reminder_id, task_id = int(reminder_id_str), int(task_id_str)
+
+    found = await get_reminder_with_task(reminder_id)
+    if found is None:
+        await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
+        return
+    reminder, task = found
+
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.reminder_notification_text(task, reminder.offset),
+        reply_markup=reminder_notification_keyboard(reminder_id, task).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("remind_open_card:"))
+async def remind_open_card(callback: CallbackQuery) -> None:
+    """"✏️ Открыть карточку" под пуш-уведомлением — превращает само
+    уведомление в полную карточку задачи (изменить текст/дату/напоминания,
+    удалить), чтобы не нужно было отдельно идти в общее меню "📋 Задачи" и
+    искать дело в списке."""
+    _, reminder_id_str, task_id_str = callback.data.split(":", maxsplit=2)
+    task_id = int(task_id_str)
+
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    reminders = await get_task_reminders(task_id)
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.task_card_text(task, reminders),
+        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+    )
