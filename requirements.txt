@@ -16,3 +16,8 @@ pydantic-settings>=2.1.0
 
 # Фоновый планировщик для напоминаний о дедлайнах (Time Management Module)
 APScheduler>=3.10.4
+
+# HTTP-клиент для обращения к DeepSeek API (распознавание задач из текста,
+# см. services/ai_parser.py). aiogram и так тянет его как зависимость, но
+# указываем явно, чтобы версия не "плавала" молча.
+aiohttp>=3.9.0

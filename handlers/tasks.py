@@ -92,6 +92,7 @@ from keyboards import (
     time_drum_keyboard,
 )
 from handlers import checklist
+from services import ai_parser
 from services.meme_manager import get_success_reward
 from services.task_actions import complete_task_core
 
@@ -462,7 +463,74 @@ async def add_task_from_text(message: Message) -> None:
         return
 
     task = await add_task(user_id=user_id, title=message.text)
-    await confirm_task_added(message, task)
+    await _create_task_with_ai(message, task)
+
+
+# --- Распознавание даты/приоритета из текста через ИИ (DeepSeek) --------------
+
+async def _create_task_with_ai(message: Message, task) -> None:
+    """
+    Пробует распознать в исходном тексте сообщения дедлайн и/или приоритет
+    (см. services.ai_parser) и, если получилось, применяет их сразу к уже
+    созданной задаче — без лишних шагов мастера там, где ИИ и так всё понял.
+
+    Если ИИ недоступен (нет ключа, нет сети, непонятный ответ) — просто
+    ведём себя как раньше: показываем обычное подтверждение с выбором
+    приоритета (confirm_task_added).
+    """
+    parsed = await ai_parser.parse_task_message(message.text)
+
+    if parsed is None:
+        await confirm_task_added(message, task)
+        return
+
+    user_id = task.user_id
+
+    if parsed.title and parsed.title != task.title:
+        await update_task_title(task_id=task.task_id, user_id=user_id, title=parsed.title)
+
+    if parsed.priority is not None:
+        await set_task_priority(task_id=task.task_id, user_id=user_id, priority=parsed.priority)
+
+    if parsed.deadline is not None:
+        await set_task_deadline(
+            task_id=task.task_id, user_id=user_id, deadline=parsed.deadline, all_day=parsed.all_day
+        )
+
+    task = await get_task(task_id=task.task_id, user_id=user_id)
+    if task is None:
+        return
+
+    if parsed.priority is None:
+        # Приоритет ИИ не назвал явно — как и раньше, спрашиваем его сами.
+        # Если дедлайн всё же распознан, он уже тихо сохранён в БД —
+        # process_priority_choice сам это обнаружит и пропустит пресеты
+        # срока, сразу перейдя к напоминаниям.
+        if parsed.deadline is not None:
+            intro = (
+                "🤖 Заметила дату в сообщении.\n"
+                + texts.task_added_text(task.title, task.priority)
+                + f"\n⏳ <i>Срок: {texts.format_deadline(task.deadline, task.deadline_all_day)}</i>"
+            )
+            await message.answer(intro, reply_markup=priority_keyboard(task.task_id).as_markup())
+        else:
+            await confirm_task_added(message, task)
+        return
+
+    # Приоритет уже определён ИИ — отдельно спрашивать не нужно.
+    intro = "🤖 Распознала из сообщения:\n" + texts.task_added_text(task.title, task.priority)
+
+    if task.deadline is not None:
+        available_offsets = available_reminder_offsets(task.deadline)
+        await message.answer(
+            intro + f"\n⏳ <i>Срок: {texts.format_deadline(task.deadline, task.deadline_all_day)}</i>",
+            reply_markup=reminders_keyboard(CTX_NEW, task.task_id, available_offsets, set()).as_markup(),
+        )
+    else:
+        await message.answer(
+            intro,
+            reply_markup=deadline_presets_keyboard(CTX_NEW, task.task_id).as_markup(),
+        )
 
 
 # --- Обработка нажатия на кнопку приоритета (🟢/🟡/🔴) -------------------------
@@ -485,6 +553,18 @@ async def process_priority_choice(callback: CallbackQuery) -> None:
 
     task = await get_task(task_id=task_id, user_id=callback.from_user.id)
     if task is None:
+        return
+
+    if task.deadline is not None:
+        # Дедлайн уже определён заранее (ИИ распознал его из исходного
+        # сообщения ещё до выбора приоритета, см. _create_task_with_ai) —
+        # пресеты срока тут ни к чему, сразу переходим к напоминаниям, как
+        # будто дедлайн только что выбрали в календаре.
+        available_offsets = available_reminder_offsets(task.deadline)
+        await callback.message.edit_text(
+            texts.reminders_prompt_text(task.title, task.deadline, task.deadline_all_day),
+            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, set()).as_markup(),
+        )
         return
 
     # Приоритет выбран — переходим к следующему шагу мастера: экран быстрых
