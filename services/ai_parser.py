@@ -47,6 +47,28 @@ _PRIORITY_BY_CODE = {
 
 
 @dataclass
+class ParsedReminderTime:
+    """
+    Результат разбора свободной фразы про ВРЕМЯ НАПОМИНАНИЯ (не самой
+    задачи — см. ParsedTask ниже) через parse_reminder_time. Ровно один из
+    двух вариантов заполнен, второй — None:
+
+    kind="relative" — человек описал время ОТНОСИТЕЛЬНО дедлайна ("за 3
+    часа до дедлайна", "за день до срока") — seconds_before_deadline
+    заполнено, и remind_at пересчитается автоматически, если дедлайн потом
+    поменяется (см. database.requests.recompute_reminders_for_new_deadline).
+
+    kind="absolute" — человек назвал КОНКРЕТНЫЙ момент ("в пятницу в
+    18:30", "завтра утром", "сегодня вечером") — absolute_at заполнено (в
+    ТОМ ЖЕ часовом поясе, что и переданный в parse_reminder_time now), и
+    остаётся фиксированным независимо от дедлайна задачи.
+    """
+    kind: str  # "relative" | "absolute"
+    seconds_before_deadline: int | None
+    absolute_at: datetime | None
+
+
+@dataclass
 class ParsedTask:
     """Результат распознавания одного сообщения."""
     title: str
@@ -164,4 +186,109 @@ async def parse_task_message(text: str, now: datetime | None = None) -> ParsedTa
         return ParsedTask(title=title, deadline=deadline, all_day=all_day, priority=priority, is_shared=is_shared)
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
         logger.exception("Не удалось разобрать ответ DeepSeek: %r", data)
+        return None
+
+
+def _reminder_system_prompt(deadline: datetime, now: datetime) -> str:
+    return (
+        "Ты помогаешь Telegram-боту «Thomas Koszaczy» понять, КОГДА именно "
+        "прислать напоминание о задаче — пользователь только что описал "
+        "это своими словами (текстом или голосом) вместо выбора готового "
+        "пресета.\n"
+        f"Сейчас: {now.strftime('%Y-%m-%d %H:%M')} ({_WEEKDAY_NAMES_RU[now.weekday()]}).\n"
+        f"Дедлайн этой задачи: {deadline.strftime('%Y-%m-%d %H:%M')} "
+        f"({_WEEKDAY_NAMES_RU[deadline.weekday()]}).\n\n"
+        "В ответ пришли СТРОГО один JSON-объект без пояснений и без "
+        "markdown-разметки, ровно с такими полями:\n"
+        "{\n"
+        '  "type": "relative" — если время описано ОТНОСИТЕЛЬНО дедлайна '
+        "(\"за 3 часа до дедлайна\", \"за день до срока\", \"за 15 минут до "
+        "того как нужно сдать\"), или "
+        '"absolute" — если назван КОНКРЕТНЫЙ момент времени, не привязанный '
+        "к формулировке \"до дедлайна\" (\"в пятницу в 18:30\", \"завтра "
+        "утром\", \"сегодня вечером\", \"через 2 часа\" — это тоже "
+        "absolute, конкретный момент от текущего времени, а не от "
+        "дедлайна),\n"
+        '  "seconds_before_deadline": целое число секунд, если type='
+        '"relative" (сколько секунд ДО дедлайна), иначе null,\n'
+        '  "datetime": строка "YYYY-MM-DD HH:MM", если type="absolute" '
+        "(переведи относительные слова вроде \"завтра утром\" в конкретную "
+        "дату и час относительно текущего момента выше; \"утром\" — 09:00, "
+        "\"днём\" — 14:00, \"вечером\" — 19:00, если точный час не назван), "
+        "иначе null.\n"
+        "}\n\n"
+        "Если сообщение вообще не похоже на описание времени напоминания — "
+        'всё равно попробуй угадать наиболее вероятный смысл, не возвращай '
+        "пустой ответ."
+    )
+
+
+async def parse_reminder_time(
+    text: str, deadline: datetime, now: datetime
+) -> ParsedReminderTime | None:
+    """
+    Аналог parse_task_message, но для ОДНОГО конкретного вопроса — когда
+    именно прислать напоминание (кнопка "✏️ Свой вариант" в меню
+    напоминаний, см. handlers/tasks.py::rmd_custom). deadline и now — ОБА
+    в одном и том же (ЛИЧНОМ) часовом поясе автора, как и в
+    parse_task_message; возвращённый ParsedReminderTime.absolute_at (для
+    type="absolute") остаётся в том же часовом поясе — перевод в серверное
+    время для сохранения делает вызывающий код.
+
+    None — при любой проблеме (ключ не задан, нет сети, ИИ вернул
+    нечитаемое) — вызывающий код должен показать человеку, что не
+    получилось разобрать, и предложить попробовать ещё раз или выбрать
+    готовый пресет, а не падать с ошибкой.
+    """
+    if not settings.deepseek_api_key:
+        return None
+
+    payload = {
+        "model": _MODEL,
+        "messages": [
+            {"role": "system", "content": _reminder_system_prompt(deadline, now)},
+            {"role": "user", "content": text},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": 200,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.deepseek_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+            async with session.post(_API_URL, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("DeepSeek (напоминание) вернул статус %s: %s", resp.status, body[:300])
+                    return None
+                data = await resp.json()
+    except Exception:
+        logger.exception("Не удалось обратиться к DeepSeek (напоминание)")
+        return None
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        kind = str(parsed.get("type") or "")
+
+        if kind == "relative":
+            seconds = parsed.get("seconds_before_deadline")
+            if not isinstance(seconds, (int, float)) or seconds <= 0:
+                return None
+            return ParsedReminderTime(kind="relative", seconds_before_deadline=int(seconds), absolute_at=None)
+
+        if kind == "absolute":
+            dt_str = parsed.get("datetime")
+            if not dt_str:
+                return None
+            absolute_at = datetime.strptime(str(dt_str), "%Y-%m-%d %H:%M")
+            return ParsedReminderTime(kind="absolute", seconds_before_deadline=None, absolute_at=absolute_at)
+
+        return None
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        logger.exception("Не удалось разобрать ответ DeepSeek (напоминание): %r", data)
         return None

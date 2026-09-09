@@ -59,6 +59,7 @@ from database.requests import (
     delete_task,
     get_active_tasks,
     get_active_tasks_by_deadline,
+    get_default_reminder_offsets,
     get_partner,
     get_reminder_with_task,
     get_streak_status,
@@ -115,6 +116,13 @@ router = Router(name="tasks")
 # сообщением (см. card_edittext / add_task_from_text).
 _pending_rename: dict[int, int] = {}
 
+# user_id -> (context, task_id), ждём текстом/голосом описание времени
+# для "Своего варианта" напоминания (кнопка "✏️ Свой вариант" в меню
+# напоминаний, см. rmd_custom / _handle_custom_reminder_input). Тот же
+# простой словарь в памяти процесса, что и _pending_rename выше — без
+# полноценного FSM.
+_pending_custom_reminder: dict[int, tuple[str, int]] = {}
+
 
 @dataclass
 class _QuickCloseSession:
@@ -151,6 +159,41 @@ async def confirm_task_added(message: Message, task, note: str | None = None) ->
     if note:
         text = f"{text}\n\n{note}"
     await message.answer(text, reply_markup=keyboard.as_markup())
+
+
+async def _apply_default_reminders(
+    task_id: int, user_id: int, deadline, available_offsets: list,
+) -> set:
+    """
+    Сразу после того, как у НОВОЙ задачи впервые появляется дедлайн —
+    создаёт и планирует напоминания из "стандартных пресетов" пользователя
+    (👤 Профиль → 🔔 Уведомления → "⏱ Изменить стандартные пресеты", см.
+    database.requests.get_default_reminder_offsets), если они настроены,
+    вместо того чтобы каждый раз начинать с пустого меню чекбоксов.
+
+    Пересекается с available_offsets — если дедлайн слишком близко и
+    какой-то дефолт уже физически не успел бы сработать, он просто тихо
+    пропускается, без ошибок. У большинства пользователей (пока они явно
+    не настроили свои пресеты) default_reminder_offsets пуст — тогда
+    поведение ровно то же, что и раньше (пустой набор чекбоксов).
+
+    deadline — СЕРВЕРНОЕ время дедлайна (до localize_task/перевода в
+    личный часовой пояс) — как и у available_reminder_offsets.
+    Возвращает итоговый набор ReminderOffset из БД — им можно сразу
+    рисовать чекбоксы в reminders_keyboard.
+    """
+    defaults = await get_default_reminder_offsets(user_id)
+    if defaults:
+        for offset in defaults:
+            if offset not in available_offsets:
+                continue
+            remind_at = deadline - REMINDER_OFFSET_DELTAS[offset]
+            if remind_at <= datetime.now():
+                continue
+            reminder = await add_reminder(task_id, offset, remind_at)
+            await scheduler_service.schedule_reminder(task_id, offset, reminder.reminder_id, remind_at)
+
+    return {reminder.offset for reminder in await get_task_reminders(task_id)}
 
 
 def _split_tasks_by_filter(tasks: list, viewer_user_id: int) -> dict:
@@ -672,6 +715,13 @@ async def _qc_finalize(callback: CallbackQuery, session: "_QuickCloseSession", k
 async def add_task_from_text(message: Message) -> None:
     user_id = message.from_user.id
 
+    pending_custom_reminder = _pending_custom_reminder.pop(user_id, None)
+    if pending_custom_reminder is not None:
+        # Ждали текст с описанием времени для "Своего варианта" напоминания
+        # (кнопка "✏️ Свой вариант", см. rmd_custom) — это не новая задача.
+        await _handle_custom_reminder_input(message, user_id, pending_custom_reminder, message.text)
+        return
+
     if await checklist.try_handle_pending_text(message):
         # Ждали текст нового пункта чек-листа (рутина или быстрое дело на
         # сегодня, см. handlers/checklist.py::chk_add_routine/chk_add_task) —
@@ -726,6 +776,29 @@ async def add_task_from_voice(message: Message) -> None:
     того, кому всё равно откажем.
     """
     user_id = message.from_user.id
+
+    pending_custom_reminder = _pending_custom_reminder.pop(user_id, None)
+    if pending_custom_reminder is not None:
+        # Ждали голос с описанием времени для "Своего варианта" напоминания
+        # (см. add_task_from_text про тот же случай текстом) — распознаём
+        # и сразу отдаём в тот же разбор, что и текстовый путь; кредит
+        # лимита списываем ОДИН раз здесь же (см. credit_already_charged
+        # в _handle_custom_reminder_input) — распознавание речи само по
+        # себе уже стоит денег, повторно считать разбор смысла нет.
+        if not await can_use_ai_parse(user_id):
+            await message.answer(texts.free_voice_limit_reached_text())
+            return
+        file_info = await message.bot.get_file(message.voice.file_id)
+        audio_file = await message.bot.download_file(file_info.file_path)
+        transcribed = await voice_service.transcribe_voice(audio_file.read())
+        await register_ai_parse_usage(user_id)
+        if not transcribed:
+            await message.answer(texts.voice_transcription_unavailable_text())
+            return
+        await _handle_custom_reminder_input(
+            message, user_id, pending_custom_reminder, transcribed, credit_already_charged=True
+        )
+        return
 
     # Голосом сюда попадают и те, кто в этот момент ждал текстового ввода
     # для чек-листа (см. handlers/checklist.py::_pending_add — "напиши
@@ -867,10 +940,12 @@ async def _create_task_with_ai(
         # database/requests.py), иначе доступность вариантов посчиталась
         # бы неверно.
         available_offsets = available_reminder_offsets(task.deadline)
+        deadline_server = task.deadline
         timeutils.localize_task(task, tz_offset)
+        selected_offsets = await _apply_default_reminders(task.task_id, user_id, deadline_server, available_offsets)
         await message.answer(
             intro + f"\n⏳ <i>Срок: {texts.format_deadline(task.deadline, task.deadline_all_day)}</i>",
-            reply_markup=reminders_keyboard(CTX_NEW, task.task_id, available_offsets, set()).as_markup(),
+            reply_markup=reminders_keyboard(CTX_NEW, task.task_id, available_offsets, selected_offsets).as_markup(),
         )
     else:
         await message.answer(
@@ -907,10 +982,14 @@ async def process_priority_choice(callback: CallbackQuery) -> None:
         # пресеты срока тут ни к чему, сразу переходим к напоминаниям, как
         # будто дедлайн только что выбрали в календаре.
         available_offsets = available_reminder_offsets(task.deadline)
+        deadline_server = task.deadline
         timeutils.localize_task(task, await _user_offset(callback.from_user.id))
+        selected_offsets = await _apply_default_reminders(
+            task_id, callback.from_user.id, deadline_server, available_offsets
+        )
         await callback.message.edit_text(
             texts.reminders_prompt_text(task.title, task.deadline, task.deadline_all_day),
-            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, set()).as_markup(),
+            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets).as_markup(),
         )
         return
 
@@ -1200,11 +1279,14 @@ async def _save_all_day_deadline(
 
     if context == CTX_NEW:
         # Новая задача — напоминаний по ней ещё физически не может быть,
-        # просто показываем шаг их выбора (см. td_confirm/CTX_NEW).
+        # кроме, возможно, "стандартных пресетов" из профиля (см.
+        # _apply_default_reminders) — показываем шаг их выбора (см.
+        # td_confirm/CTX_NEW) уже с ними отмеченными.
         available_offsets = available_reminder_offsets(deadline)
+        selected_offsets = await _apply_default_reminders(task_id, user_id, deadline, available_offsets)
         await callback.message.edit_text(
             texts.reminders_prompt_text(task.title, deadline, all_day=True),
-            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets=set()).as_markup(),
+            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets).as_markup(),
         )
         return
 
@@ -1325,9 +1407,10 @@ async def td_confirm(callback: CallbackQuery) -> None:
 
         await callback.answer("Дедлайн сохранён ✅")
         available_offsets = available_reminder_offsets(server_chosen)
+        selected_offsets = await _apply_default_reminders(task_id, user_id, server_chosen, available_offsets)
         await callback.message.edit_text(
             texts.reminders_prompt_text(task.title, chosen),
-            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets=set()).as_markup(),
+            reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets).as_markup(),
         )
         return
 
@@ -1388,6 +1471,14 @@ async def rmd_toggle(callback: CallbackQuery) -> None:
         if removed:
             scheduler_service.unschedule_reminder(task_id, offset)
         await callback.answer("Убрано")
+    elif offset == ReminderOffset.custom:
+        # Сюда попасть в теории нельзя — "Свой вариант" добавляется только
+        # через отдельные кнопки rmd_today20/rmd_custom (у него нет одного
+        # общего REMINDER_OFFSET_DELTAS[offset] для всех, см.
+        # database/requests.py) — но на всякий случай не падаем с KeyError,
+        # а просто мягко объясняем, чем пользоваться.
+        await callback.answer("Используй кнопку «✏️ Свой вариант» ниже 🙂", show_alert=True)
+        return
     else:
         remind_at = task.deadline - REMINDER_OFFSET_DELTAS[offset]
         if remind_at <= datetime.now():
@@ -1401,12 +1492,14 @@ async def rmd_toggle(callback: CallbackQuery) -> None:
         await scheduler_service.schedule_reminder(task_id, offset, reminder.reminder_id, remind_at)
         await callback.answer("Добавлено ✅")
 
-    updated_offsets = {reminder.offset for reminder in await get_task_reminders(task_id)}
+    updated_reminders = await get_task_reminders(task_id)
+    updated_offsets = {reminder.offset for reminder in updated_reminders}
+    custom_reminder = next((r for r in updated_reminders if r.offset == ReminderOffset.custom), None)
     # Пересчитываем доступные варианты заново — время идёт, и пока
     # человек тыкает чекбоксы, какой-то из ранее доступных вариантов мог
     # физически "протухнуть" (см. database.requests.available_reminder_offsets).
     offsets_available_now = available_reminder_offsets(task.deadline)
-    keyboard = reminders_keyboard(context, task_id, offsets_available_now, updated_offsets)
+    keyboard = reminders_keyboard(context, task_id, offsets_available_now, updated_offsets, custom_reminder)
     await callback.message.edit_reply_markup(reply_markup=keyboard.as_markup())
 
 
@@ -1456,6 +1549,176 @@ async def rmd_done(callback: CallbackQuery) -> None:
         task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
+    )
+
+
+# --- Time Management Module v2: гибкие ("Свой вариант") напоминания -----------
+
+# В котором часу присылать "🌙 Сегодня в ..." — единственный пресет,
+# независимый от дедлайна задачи (см. rmd_today20 ниже).
+_TODAY_PRESET_HOUR = 20
+
+
+async def _redraw_reminders_screen(callback: CallbackQuery, context: str, task_id: int) -> None:
+    """Общая перерисовка меню напоминаний (edit_reply_markup, без смены
+    текста) после rmd_today20 — тот же результат, что и в конце rmd_toggle/
+    rmd_clear, вынесенный отдельно, чтобы не дублировать сборку
+    custom_reminder/offsets_available_now в третий раз."""
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None or task.deadline is None:
+        return
+    reminders = await get_task_reminders(task_id)
+    offsets = {r.offset for r in reminders}
+    custom_reminder = next((r for r in reminders if r.offset == ReminderOffset.custom), None)
+    offsets_available_now = available_reminder_offsets(task.deadline)
+    keyboard = reminders_keyboard(context, task_id, offsets_available_now, offsets, custom_reminder)
+    await callback.message.edit_reply_markup(reply_markup=keyboard.as_markup())
+
+
+@router.callback_query(F.data.startswith("rmd_today20:"))
+async def rmd_today20(callback: CallbackQuery) -> None:
+    """
+    "🌙 Сегодня в 20:00" — единственный пресет "Своего варианта", который
+    можно поставить БЕЗ обращения к ИИ (значит, и без лимита/денег): просто
+    конкретное время сегодняшнего вечера, ПО ЛИЧНОМУ часовому поясу
+    (см. services/timeutils.py), независимо от дедлайна самой задачи — в
+    отличие от остальных пресетов выше, это не "за N до срока", а просто
+    "хочу пуш вечером, раз уж вспомнил(а) об этом деле".
+
+    Занимает тот же единственный "custom"-слот, что и ИИ-разбор через
+    "✏️ Свой вариант" (см. rmd_custom) — повторное нажатие заменяет
+    предыдущее "своё" напоминание, если оно уже было.
+    """
+    _, context, task_id_str = callback.data.split(":", maxsplit=2)
+    task_id = int(task_id_str)
+    user_id = callback.from_user.id
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None or task.deadline is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    tz_offset = await _user_offset(user_id)
+    local_now = timeutils.user_now(tz_offset)
+    target_local = local_now.replace(hour=_TODAY_PRESET_HOUR, minute=0, second=0, microsecond=0)
+    if target_local <= local_now:
+        await callback.answer(
+            "Сегодня в 20:00 уже прошло — попробуй «✏️ Свой вариант» и укажи другое время 🙂",
+            show_alert=True,
+        )
+        return
+
+    remind_at = timeutils.to_server(target_local, tz_offset)
+    await remove_reminder(task_id, ReminderOffset.custom)
+    scheduler_service.unschedule_reminder(task_id, ReminderOffset.custom)
+    reminder = await add_reminder(task_id, ReminderOffset.custom, remind_at, custom_label="Сегодня в 20:00")
+    await scheduler_service.schedule_reminder(task_id, ReminderOffset.custom, reminder.reminder_id, remind_at)
+
+    await callback.answer("Добавлено ✅")
+    await _redraw_reminders_screen(callback, context, task_id)
+
+
+@router.callback_query(F.data.startswith("rmd_custom:"))
+async def rmd_custom(callback: CallbackQuery) -> None:
+    """
+    "✏️ Свой вариант" — вместо готового пресета человек описывает время
+    напоминания своими словами (текстом или голосом), ИИ переводит фразу в
+    точный момент (см. services.ai_parser.parse_reminder_time). Тратит тот
+    же бесплатный лимит ИИ-разбора, что и создание задачи с датой в тексте
+    (см. can_use_ai_parse) — проверяем ДО того, как заводить ожидание
+    следующего сообщения, чтобы не открывать приглашение впустую тому,
+    кому всё равно откажем.
+    """
+    _, context, task_id_str = callback.data.split(":", maxsplit=2)
+    task_id = int(task_id_str)
+    user_id = callback.from_user.id
+
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None or task.deadline is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    if not await can_use_ai_parse(user_id):
+        await callback.answer()
+        await callback.message.answer(texts.free_ai_limit_reached_text())
+        return
+
+    # На случай, если человек параллельно ждал текст для переименования
+    # задачи или для пункта чек-листа — иначе следующее сообщение
+    # неожиданно "выстрелило" бы не туда (тот же приём, что и в
+    # add_task_from_voice про checklist._pending_add).
+    _pending_rename.pop(user_id, None)
+    checklist._pending_add.pop(user_id, None)
+    _pending_custom_reminder[user_id] = (context, task_id)
+
+    await callback.answer()
+    await callback.message.answer(texts.custom_reminder_prompt_text(task.title))
+
+
+async def _handle_custom_reminder_input(
+    message: Message, user_id: int, pending: tuple, text: str, credit_already_charged: bool = False
+) -> None:
+    """
+    Общая логика после того, как пришёл текст/расшифровка голоса для
+    "Своего варианта" (см. rmd_custom, add_task_from_text, add_task_from_voice).
+
+    credit_already_charged=True — только для голосового пути: там кредит
+    бесплатного лимита уже списан за само распознавание речи (см.
+    add_task_from_voice), а не за этот разбор — как и с обычным созданием
+    задачи, одно голосовое сообщение стоит ОДИН кредит суммарно.
+    """
+    context, task_id = pending
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None or task.deadline is None:
+        await message.answer("Не удалось найти эту задачу 🤔", reply_markup=main_menu_keyboard)
+        return
+
+    if not credit_already_charged and not await can_use_ai_parse(user_id):
+        await message.answer(texts.free_ai_limit_reached_text())
+        return
+
+    tz_offset = await _user_offset(user_id)
+    now_local = timeutils.user_now(tz_offset)
+    deadline_local = timeutils.to_user(task.deadline, tz_offset)
+
+    parsed = await ai_parser.parse_reminder_time(text, deadline=deadline_local, now=now_local)
+    if not credit_already_charged:
+        await register_ai_parse_usage(user_id)
+
+    if parsed is None:
+        await message.answer(texts.custom_reminder_not_understood_text())
+        return
+
+    if parsed.kind == "relative":
+        remind_at = task.deadline - timedelta(seconds=parsed.seconds_before_deadline)
+        label = texts.humanize_seconds_before_deadline(parsed.seconds_before_deadline)
+        custom_offset_seconds = parsed.seconds_before_deadline
+    else:
+        remind_at = timeutils.to_server(parsed.absolute_at, tz_offset)
+        label = texts.format_deadline(parsed.absolute_at, all_day=False)
+        custom_offset_seconds = None
+
+    if remind_at <= datetime.now():
+        await message.answer("Это время уже в прошлом — попробуй ещё раз, другими словами 🙂")
+        return
+
+    await remove_reminder(task_id, ReminderOffset.custom)
+    scheduler_service.unschedule_reminder(task_id, ReminderOffset.custom)
+    reminder = await add_reminder(
+        task_id, ReminderOffset.custom, remind_at,
+        custom_offset_seconds=custom_offset_seconds, custom_label=label,
+    )
+    await scheduler_service.schedule_reminder(task_id, ReminderOffset.custom, reminder.reminder_id, remind_at)
+
+    reminders = await get_task_reminders(task_id)
+    offsets = {r.offset for r in reminders}
+    custom_reminder = next((r for r in reminders if r.offset == ReminderOffset.custom), None)
+    offsets_available_now = available_reminder_offsets(task.deadline)
+    await message.answer(
+        texts.custom_reminder_set_text(label),
+        reply_markup=reminders_keyboard(
+            context, task_id, offsets_available_now, offsets, custom_reminder
         ).as_markup(),
     )
 
@@ -1527,12 +1790,16 @@ async def card_remind(callback: CallbackQuery) -> None:
         return
 
     await callback.answer()
-    current_offsets = {reminder.offset for reminder in await get_task_reminders(task_id)}
+    current_reminders = await get_task_reminders(task_id)
+    current_offsets = {reminder.offset for reminder in current_reminders}
+    custom_reminder = next((r for r in current_reminders if r.offset == ReminderOffset.custom), None)
     offsets_available_now = available_reminder_offsets(task.deadline)
     timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await callback.message.edit_text(
         texts.reminders_prompt_text(task.title, task.deadline, task.deadline_all_day),
-        reply_markup=reminders_keyboard(CTX_EDIT, task_id, offsets_available_now, current_offsets).as_markup(),
+        reply_markup=reminders_keyboard(
+            CTX_EDIT, task_id, offsets_available_now, current_offsets, custom_reminder
+        ).as_markup(),
     )
 
 

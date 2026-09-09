@@ -43,14 +43,55 @@ REMINDER_OFFSET_LABELS = {
     ReminderOffset.days_5: "За 5 дней",
     ReminderOffset.days_3: "За 3 дня",
     ReminderOffset.days_1: "За 1 день",
+    ReminderOffset.hours_2: "За 2 часа",
     ReminderOffset.hour_1: "За 1 час",
+    ReminderOffset.minutes_30: "За 30 минут",
     ReminderOffset.minutes_15: "За 15 минут",
     ReminderOffset.exact: "В точное время дедлайна",
+    # Намеренно НЕТ ReminderOffset.custom здесь — у "Своего варианта" нет
+    # одной подписи на всех, своя для каждого напоминания (см.
+    # Reminder.custom_label в database/models.py) — используй reminder_label()
+    # ниже вместо прямого обращения к этому словарю там, где в списке
+    # напоминаний может встретиться custom.
 }
+
+
+def reminder_label(reminder) -> str:
+    """Подпись одного напоминания для текста/чекбокса — обычные офсеты
+    берутся из REMINDER_OFFSET_LABELS, а "Свой вариант" — из
+    reminder.custom_label (запасной вариант на случай пустого custom_label,
+    хотя на практике он всегда заполняется при создании, см.
+    handlers/tasks.py::rmd_today20/_handle_custom_reminder_input)."""
+    if reminder.offset == ReminderOffset.custom:
+        return reminder.custom_label or "Свой вариант"
+    return REMINDER_OFFSET_LABELS[reminder.offset]
+
 
 # Порядок напоминаний в карточке задачи — тот же, что объявление Enum'а
 # (от самого дальнего смещения к самому близкому).
 _REMINDER_ORDER = {offset: index for index, offset in enumerate(ReminderOffset)}
+
+
+def humanize_seconds_before_deadline(seconds: int) -> str:
+    """
+    Короткая русская подпись для "Своего варианта", понятого ИИ как
+    ОТНОСИТЕЛЬНОЕ время ("за 3 часа до дедлайна") — см.
+    services.ai_parser.parse_reminder_time / handlers/tasks.py::
+    _handle_custom_reminder_input. Не претендует на идеальную русскую
+    склонения "1 час/2 часа/5 часов" — берёт самый частый, "читаемый"
+    вариант, этого достаточно для короткой подписи на кнопке/в карточке.
+    """
+    minutes_total = max(1, round(seconds / 60))
+    if minutes_total < 60:
+        return f"За {minutes_total} мин. до дедлайна"
+    hours_total = minutes_total / 60
+    if hours_total < 24:
+        hours_rounded = round(hours_total)
+        if hours_rounded < 1:
+            hours_rounded = 1
+        return f"За {hours_rounded} ч. до дедлайна"
+    days_rounded = max(1, round(hours_total / 24))
+    return f"За {days_rounded} дн. до дедлайна"
 
 _MONTHS_GENITIVE_RU = {
     1: "января", 2: "февраля", 3: "марта", 4: "апреля",
@@ -986,6 +1027,36 @@ def reminders_prompt_text(title: str, deadline, all_day: bool = False) -> str:
     )
 
 
+def custom_reminder_prompt_text(title: str) -> str:
+    """Приглашение написать/наговорить время напоминания своими словами —
+    кнопка "✏️ Свой вариант" в меню напоминаний (см. handlers/tasks.py::
+    rmd_custom)."""
+    return (
+        f"✏️ <b>Когда напомнить про «{escape(title)}»?</b>\n\n"
+        "Напиши или наговори голосом, например: «за 3 часа до дедлайна», "
+        "«завтра утром» или «в пятницу в 18:30» 🐾"
+    )
+
+
+def custom_reminder_not_understood_text() -> str:
+    """ИИ не смог разобрать свободную фразу про время напоминания (нет
+    ключа/сети, либо ответ оказался нечитаемым) — просим попробовать ещё
+    раз или вернуться к готовым пресетам, задача при этом никуда не
+    делась, просто напоминание не добавилось."""
+    return (
+        "🤔 Не получилось понять, когда именно напомнить — попробуй "
+        "сформулировать иначе (например, «за 2 часа до дедлайна» или "
+        "«завтра в 9 утра»), либо просто выбери готовый вариант из меню "
+        "напоминаний."
+    )
+
+
+def custom_reminder_set_text(label: str) -> str:
+    """Подтверждение после того, как "Свой вариант" (текстом/голосом или
+    пресет "Сегодня в 20:00") успешно превратился в напоминание."""
+    return f"✅ Готово! Напомню: <b>{escape(label)}</b>."
+
+
 def sharing_choice_prompt_text(title: str) -> str:
     """Приглашение выбрать категорию "Личное/Партнёр" — последний шаг
     мастера создания задачи (см. handlers/tasks.py::_offer_sharing_or_finish),
@@ -1156,6 +1227,27 @@ def notifications_settings_text() -> str:
     )
 
 
+def default_reminder_presets_text(selected: list) -> str:
+    """
+    Экран "⏱ Изменить стандартные пресеты" (Профиль → 🔔 Уведомления →
+    "⏱ Изменить стандартные пресеты", см. handlers/profile.py::defrmd_open/
+    defrmd_toggle). selected — уже выбранные ReminderOffset (см.
+    database.requests.get_default_reminder_offsets); "Свой вариант" среди
+    них никогда не бывает (см. set_default_reminder_offsets).
+    """
+    if selected:
+        current = ", ".join(REMINDER_OFFSET_LABELS[o] for o in selected)
+    else:
+        current = "не настроено — новые задачи по-прежнему без напоминаний, пока не выберешь вручную"
+    return (
+        "⏱ <b>Стандартные пресеты напоминаний</b>\n"
+        f"<i>Сейчас: {current}</i>\n\n"
+        "Отметь, что будет СРАЗУ включаться у каждой новой задачи с "
+        "дедлайном — на месте всё равно можно будет что-то добавить или "
+        "убрать вручную 👇"
+    )
+
+
 def reminder_notification_text(task, offset: ReminderOffset) -> str:
     """
     Текст пуш-уведомления, когда наступает время напоминания — два разных
@@ -1282,7 +1374,7 @@ def task_card_text(task, reminders, shared_by_partner: bool = False) -> str:
 
     if reminders:
         sorted_reminders = sorted(reminders, key=lambda r: _REMINDER_ORDER[r.offset])
-        labels = ", ".join(REMINDER_OFFSET_LABELS[r.offset] for r in sorted_reminders)
+        labels = ", ".join(reminder_label(r) for r in sorted_reminders)
         lines.append(f"🔔 <b>Напоминания:</b> {labels}")
     else:
         lines.append("🔔 <b>Напоминания:</b> нет")

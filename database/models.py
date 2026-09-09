@@ -104,9 +104,20 @@ class ReminderOffset(str, enum.Enum):
     days_5 = "5d"
     days_3 = "3d"
     days_1 = "1d"
+    hours_2 = "2h"
     hour_1 = "1h"
+    minutes_30 = "30m"
     minutes_15 = "15m"
     exact = "exact"  # напомнить ровно в момент дедлайна
+    # "Свой вариант" (Time Management Module v2, гибкие напоминания) — либо
+    # фиксированный пресет вроде "Сегодня в 20:00", либо результат ИИ-разбора
+    # свободной фразы текстом/голосом (см. services.ai_parser.parse_reminder_time,
+    # handlers/tasks.py::rmd_custom/rmd_today20). В ОТЛИЧИЕ от всех вариантов
+    # выше — не участвует в REMINDER_OFFSET_DELTAS (у него нет ОДНОГО
+    # фиксированного смещения на всех, оно своё для каждого напоминания, см.
+    # Reminder.custom_offset_seconds ниже) и на задачу может быть только ОДИН
+    # такой "свой" слот одновременно — выбор нового заменяет предыдущий.
+    custom = "custom"
 
 
 # --- Таблица пользователей ---------------------------------------------------
@@ -222,6 +233,20 @@ class User(Base):
     # на них нет.
     free_ai_parses_used: Mapped[int] = mapped_column(default=0)
 
+    # --- Пресеты напоминаний "по умолчанию" (Time Management Module v2) -----
+    # default_reminder_offsets — какие галочки в меню напоминаний (см.
+    # keyboards.reminders_keyboard) СРАЗУ отмечены и уже реально запланированы
+    # у КАЖДОЙ новой задачи с дедлайном, без ручного тыканья в те же самые
+    # пункты каждый раз (👤 Профиль → 🔔 Уведомления → "⏱ Изменить стандартные
+    # пресеты", см. handlers/profile.py::defrmd_toggle). Хранится как строка
+    # с ReminderOffset.value через запятую ("1h,15m") — проще целой отдельной
+    # таблицы ради буквально пары значений на пользователя. Пустая строка по
+    # умолчанию — ПОВЕДЕНИЕ НЕ МЕНЯЕТСЯ для всех, кто уже пользуется ботом
+    # (включая фокус-группу): пока это не настроено явно, новая задача
+    # по-прежнему не получает ни одного напоминания автоматически, как и
+    # было раньше. См. database.requests.get_default_reminder_offsets.
+    default_reminder_offsets: Mapped[str] = mapped_column(Text, default="")
+
     # Связь "один пользователь — много задач"
     tasks: Mapped[list["Task"]] = relationship(back_populates="user")
 
@@ -325,6 +350,22 @@ class Reminder(Base):
     # перезапустится ровно в этом промежутке.
     second_chance_sent: Mapped[bool] = mapped_column(default=False)
 
+    # --- Поля ТОЛЬКО для offset == ReminderOffset.custom ("Свой вариант") ---
+    # custom_offset_seconds — если напоминание было понято ИИ как ОТНОСИТЕЛЬНОЕ
+    # ("за 3 часа до дедлайна") — сколько секунд ДО дедлайна, чтобы при
+    # изменении дедлайна задачи (database.requests.recompute_reminders_for_new_deadline)
+    # remind_at пересчитался вместе с ним, как и у обычных пресетов. None —
+    # если это АБСОЛЮТНЫЙ момент времени ("в пятницу в 18:30", "Сегодня в
+    # 20:00") — тогда remind_at при правке дедлайна НЕ трогаем, он не связан
+    # с дедлайном никак.
+    custom_offset_seconds: Mapped[int | None] = mapped_column(nullable=True, default=None)
+
+    # custom_label — что показать вместо статичной подписи из
+    # keyboards.REMINDER_OFFSET_LABELS (там для offset=custom записи попросту
+    # нет — у каждого "своего" напоминания подпись своя, например "За 3 часа
+    # до дедлайна" или "Сегодня в 20:00").
+    custom_label: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+
     task: Mapped["Task"] = relationship(back_populates="reminders")
 
 
@@ -422,6 +463,10 @@ async def _migrate_missing_columns(conn) -> None:
         await conn.exec_driver_sql(
             "ALTER TABLE users ADD COLUMN free_ai_parses_used INTEGER NOT NULL DEFAULT 0"
         )
+    if "default_reminder_offsets" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN default_reminder_offsets TEXT NOT NULL DEFAULT ''"
+        )
 
     result = await conn.exec_driver_sql("PRAGMA table_info(tasks)")
     existing_task_columns = {row[1] for row in result.fetchall()}
@@ -450,6 +495,12 @@ async def _migrate_missing_columns(conn) -> None:
         await conn.exec_driver_sql(
             "ALTER TABLE reminders ADD COLUMN second_chance_sent BOOLEAN NOT NULL DEFAULT 0"
         )
+    if existing_reminder_columns and "custom_offset_seconds" not in existing_reminder_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE reminders ADD COLUMN custom_offset_seconds INTEGER"
+        )
+    if existing_reminder_columns and "custom_label" not in existing_reminder_columns:
+        await conn.exec_driver_sql("ALTER TABLE reminders ADD COLUMN custom_label TEXT")
 
 
 async def init_db() -> None:

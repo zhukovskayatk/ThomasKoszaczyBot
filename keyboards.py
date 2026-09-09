@@ -21,6 +21,7 @@ from texts import (
     URGENCY_MARKERS,
     button_deadline_suffix,
     format_utc_offset,
+    reminder_label,
     task_urgency_category,
 )
 
@@ -538,7 +539,9 @@ def time_drum_keyboard(
 # именно под сетку 2 колонки, которую проще всего читать по возрастанию.
 _REMINDER_DISPLAY_ORDER = (
     ReminderOffset.minutes_15,
+    ReminderOffset.minutes_30,
     ReminderOffset.hour_1,
+    ReminderOffset.hours_2,
     ReminderOffset.days_1,
     ReminderOffset.days_3,
     ReminderOffset.days_5,
@@ -548,7 +551,7 @@ _REMINDER_DISPLAY_ORDER = (
 
 
 def reminders_keyboard(
-    context: str, task_id: int, available_offsets, selected_offsets: set
+    context: str, task_id: int, available_offsets, selected_offsets: set, custom_reminder=None,
 ) -> InlineKeyboardBuilder:
     """
     Мультивыбор напоминаний (чекбоксы ◻️/☑️) компактной сеткой в 2 колонки
@@ -568,6 +571,15 @@ def reminders_keyboard(
     а время с тех пор почти истекло, галочку всё равно нужно показать —
     иначе её будет невозможно снять.
 
+    custom_reminder — уже существующий Reminder с offset=ReminderOffset.custom
+    ("Свой вариант"), если он есть (см. database.requests.get_task_reminders) —
+    рисуется отдельной широкой строкой со своей подписью (reminder.custom_label)
+    и чекбоксом; снимается тем же rmd_toggle, что и обычные офсеты. Если
+    его ещё нет — вместо галочки показываем две кнопки-приглашения
+    ("🌙 Сегодня в 20:00" и "✏️ Свой вариант"), см. handlers/tasks.py::
+    rmd_today20/rmd_custom. На задачу может быть только ОДИН такой слот
+    одновременно — выбор нового заменяет предыдущий.
+
     context решает, куда вернуться по кнопке "💾 Готово к сохранению" — см.
     keyboards.CTX_NEW / CTX_EDIT.
     """
@@ -582,8 +594,6 @@ def reminders_keyboard(
             text=f"{checkbox} {REMINDER_OFFSET_LABELS[offset]}",
             callback_data=f"rmd_toggle:{context}:{task_id}:{offset.value}",
         )
-    builder.button(text="🔕 Без напоминаний", callback_data=f"rmd_clear:{context}:{task_id}")
-    builder.button(text="💾 Готово к сохранению", callback_data=f"rmd_done:{context}:{task_id}")
 
     # "В точное время дедлайна" (если доступно — оно всегда последним в
     # _REMINDER_DISPLAY_ORDER) идёт отдельной широкой строкой, остальные —
@@ -599,7 +609,63 @@ def reminders_keyboard(
         remaining -= take
     if has_exact:
         row_sizes.append(1)
+
+    if custom_reminder is not None:
+        builder.button(
+            text=f"☑️ {reminder_label(custom_reminder)}",
+            callback_data=f"rmd_toggle:{context}:{task_id}:{ReminderOffset.custom.value}",
+        )
+        row_sizes.append(1)
+    else:
+        builder.button(text="🌙 Сегодня в 20:00", callback_data=f"rmd_today20:{context}:{task_id}")
+        builder.button(text="✏️ Свой вариант", callback_data=f"rmd_custom:{context}:{task_id}")
+        row_sizes.append(2)
+
+    builder.button(text="🔕 Без напоминаний", callback_data=f"rmd_clear:{context}:{task_id}")
+    builder.button(text="💾 Готово к сохранению", callback_data=f"rmd_done:{context}:{task_id}")
     row_sizes += [1, 1]
+
+    builder.adjust(*row_sizes)
+    return builder
+
+
+def default_reminder_presets_keyboard(selected: set) -> InlineKeyboardBuilder:
+    """
+    Экран "⏱ Изменить стандартные пресеты" (Профиль → 🔔 Уведомления, см.
+    handlers/profile.py::defrmd_open/defrmd_toggle) — та же сетка чекбоксов
+    2 колонки, что и у reminders_keyboard (см. _REMINDER_DISPLAY_ORDER), но
+    БЕЗ привязки к конкретной задаче: здесь просто настраивается, какие
+    пункты будут отмечены сразу у КАЖДОЙ новой задачи. "Свой вариант" тут
+    осознанно нет — применить его автоматически без участия человека
+    попросту нечем (см. database.requests.set_default_reminder_offsets).
+    """
+    builder = InlineKeyboardBuilder()
+    has_exact = ReminderOffset.exact in _REMINDER_DISPLAY_ORDER
+    pair_offsets = [o for o in _REMINDER_DISPLAY_ORDER if o != ReminderOffset.exact]
+
+    for offset in pair_offsets:
+        checkbox = "☑️" if offset in selected else "◻️"
+        builder.button(
+            text=f"{checkbox} {REMINDER_OFFSET_LABELS[offset]}",
+            callback_data=f"defrmd_toggle:{offset.value}",
+        )
+    if ReminderOffset.exact in _REMINDER_DISPLAY_ORDER:
+        checkbox = "☑️" if ReminderOffset.exact in selected else "◻️"
+        builder.button(
+            text=f"{checkbox} {REMINDER_OFFSET_LABELS[ReminderOffset.exact]}",
+            callback_data=f"defrmd_toggle:{ReminderOffset.exact.value}",
+        )
+    builder.button(text="◀️ Назад к уведомлениям", callback_data="defrmd_back")
+
+    row_sizes = []
+    remaining = len(pair_offsets)
+    while remaining > 0:
+        take = min(2, remaining)
+        row_sizes.append(take)
+        remaining -= take
+    if has_exact:
+        row_sizes.append(1)
+    row_sizes.append(1)
 
     builder.adjust(*row_sizes)
     return builder
@@ -781,8 +847,9 @@ def notification_settings_keyboard(
         text=f"{checklist_evening_mark} 🌙 Вечерняя сводка чек-листа (21:00) 💎",
         callback_data="notif_toggle:checklist_evening",
     )
+    builder.button(text="⏱ Изменить стандартные пресеты", callback_data="defrmd_open")
     builder.button(text="◀️ Назад к профилю", callback_data="notif_back")
-    builder.adjust(1, 1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1, 1, 1)
     return builder
 
 

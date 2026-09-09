@@ -925,9 +925,17 @@ REMINDER_OFFSET_DELTAS: dict[ReminderOffset, timedelta] = {
     ReminderOffset.days_5: timedelta(days=5),
     ReminderOffset.days_3: timedelta(days=3),
     ReminderOffset.days_1: timedelta(days=1),
+    ReminderOffset.hours_2: timedelta(hours=2),
     ReminderOffset.hour_1: timedelta(hours=1),
+    ReminderOffset.minutes_30: timedelta(minutes=30),
     ReminderOffset.minutes_15: timedelta(minutes=15),
     ReminderOffset.exact: timedelta(0),
+    # Намеренно НЕТ ReminderOffset.custom здесь — у него нет ОДНОГО смещения,
+    # общего для всех: своё для каждого напоминания хранится в
+    # Reminder.custom_offset_seconds (или его нет вовсе, если это абсолютный
+    # момент времени, см. database/models.py::Reminder). Везде, где этот
+    # словарь используется по всем ReminderOffset разом (available_reminder_offsets
+    # ниже, unschedule_all_for_task) — custom обрабатывается отдельно.
 }
 
 
@@ -946,8 +954,61 @@ def available_reminder_offsets(deadline: datetime) -> list[ReminderOffset]:
     now = datetime.now()
     return [
         offset for offset in ReminderOffset
-        if deadline - REMINDER_OFFSET_DELTAS[offset] > now
+        if offset != ReminderOffset.custom and deadline - REMINDER_OFFSET_DELTAS[offset] > now
     ]
+
+
+def parse_default_reminder_offsets(raw: str) -> list[ReminderOffset]:
+    """
+    Разбирает User.default_reminder_offsets ("1h,15m") в список ReminderOffset —
+    неизвестные/битые куски просто пропускаются, а не роняют весь разбор
+    (на случай ручной правки БД или будущего переименования значений).
+    ReminderOffset.custom сюда никогда не попадает осознанно — см.
+    set_default_reminder_offsets.
+    """
+    if not raw:
+        return []
+    offsets: list[ReminderOffset] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            offsets.append(ReminderOffset(chunk))
+        except ValueError:
+            continue
+    return offsets
+
+
+async def get_default_reminder_offsets(user_id: int) -> list[ReminderOffset]:
+    """Пресеты напоминаний "по умолчанию" (👤 Профиль → 🔔 Уведомления →
+    "⏱ Изменить стандартные пресеты") — применяются к КАЖДОЙ новой задаче
+    сразу после того, как у неё впервые появляется дедлайн (см.
+    handlers/tasks.py::_apply_default_reminders). Пустой список — у
+    большинства пользователей, пока они явно не настроили свои пресеты
+    (см. миграцию default_reminder_offsets в database/models.py)."""
+    user = await get_user(user_id)
+    if user is None:
+        return []
+    return parse_default_reminder_offsets(user.default_reminder_offsets)
+
+
+async def set_default_reminder_offsets(user_id: int, offsets: list[ReminderOffset]) -> None:
+    """Сохраняет новый набор пресетов "по умолчанию" — вызывается при
+    каждом клике по чекбоксу на экране "⏱ Изменить стандартные пресеты"
+    (см. handlers/profile.py::defrmd_toggle)."""
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return
+        # ReminderOffset.custom осознанно не может быть "дефолтом" — у него
+        # нет заранее известного времени, применить его автоматически к
+        # новой задаче попросту нечем (не с чем спрашивать ИИ или "сегодня
+        # в 20:00" без участия человека).
+        user.default_reminder_offsets = ",".join(
+            o.value for o in offsets if o != ReminderOffset.custom
+        )
+        await session.commit()
 
 
 async def set_task_deadline(
@@ -1020,14 +1081,31 @@ async def get_task_reminders(task_id: int) -> list[Reminder]:
         return list(result.scalars().all())
 
 
-async def add_reminder(task_id: int, offset: ReminderOffset, remind_at: datetime) -> Reminder:
+async def add_reminder(
+    task_id: int,
+    offset: ReminderOffset,
+    remind_at: datetime,
+    custom_offset_seconds: int | None = None,
+    custom_label: str | None = None,
+) -> Reminder:
     """
     Создаёт запись напоминания в БД. Постановку в APScheduler делает
     вызывающий код (services/scheduler.py::schedule_reminder) — здесь
     только работа с базой.
+
+    custom_offset_seconds/custom_label — используются ТОЛЬКО при
+    offset=ReminderOffset.custom ("Свой вариант", см. database/models.py::
+    Reminder) — для остальных офсетов оба параметра остаются None.
     """
     async with async_session() as session:
-        reminder = Reminder(task_id=task_id, offset=offset, remind_at=remind_at, sent=False)
+        reminder = Reminder(
+            task_id=task_id,
+            offset=offset,
+            remind_at=remind_at,
+            sent=False,
+            custom_offset_seconds=custom_offset_seconds,
+            custom_label=custom_label,
+        )
         session.add(reminder)
         await session.commit()
         await session.refresh(reminder)
@@ -1082,6 +1160,12 @@ async def recompute_reminders_for_new_deadline(
     под новый дедлайн — сами напоминания (и то, что было выбрано) остаются,
     просто "едут" вместе с новой датой/временем.
 
+    Особый случай — ReminderOffset.custom ("Свой вариант"): если оно было
+    понято ИИ как ОТНОСИТЕЛЬНОЕ ("за 3 часа до дедлайна", custom_offset_seconds
+    не None) — едет вместе с дедлайном точно так же, как и обычные пресеты.
+    Если это АБСОЛЮТНЫЙ момент ("в пятницу в 18:30", custom_offset_seconds
+    is None) — трогать его нечем и незачем, оставляем как есть.
+
     Если пересчитанное время оказалось в прошлом — такое напоминание молча
     удаляется целиком (бессмысленно напоминать о том, что уже наступило).
 
@@ -1098,7 +1182,15 @@ async def recompute_reminders_for_new_deadline(
         kept: list[Reminder] = []
         removed_offsets: list[ReminderOffset] = []
         for reminder in reminders:
-            new_remind_at = new_deadline - REMINDER_OFFSET_DELTAS[reminder.offset]
+            if reminder.offset == ReminderOffset.custom:
+                if reminder.custom_offset_seconds is None:
+                    kept.append(reminder)
+                    continue
+                delta = timedelta(seconds=reminder.custom_offset_seconds)
+            else:
+                delta = REMINDER_OFFSET_DELTAS[reminder.offset]
+
+            new_remind_at = new_deadline - delta
             if new_remind_at <= now:
                 removed_offsets.append(reminder.offset)
                 await session.delete(reminder)

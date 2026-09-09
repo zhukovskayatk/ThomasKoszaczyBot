@@ -18,12 +18,15 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 import texts
+from database.models import ReminderOffset
 from database.requests import (
     count_completed_tasks,
+    get_default_reminder_offsets,
     get_or_create_user,
     get_streak_status,
     get_user,
     rescue_streak_with_xp,
+    set_default_reminder_offsets,
     set_user_utc_offset,
     toggle_checklist_evening_push_enabled,
     toggle_checklist_morning_push_enabled,
@@ -34,6 +37,7 @@ from database.requests import (
 from keyboards import (
     LEGACY_PROFILE_BUTTON_TEXTS,
     PROFILE_BUTTON_TEXT,
+    default_reminder_presets_keyboard,
     main_menu_keyboard,
     notification_settings_keyboard,
     profile_actions_keyboard,
@@ -208,6 +212,47 @@ async def notif_toggle(callback: CallbackQuery) -> None:
             user.checklist_evening_push_enabled,
         ).as_markup()
     )
+
+
+# --- Экран "⏱ Стандартные пресеты напоминаний" (Time Management Module v2) ----
+
+@router.callback_query(F.data == "defrmd_open")
+async def defrmd_open(callback: CallbackQuery) -> None:
+    """Кнопка "⏱ Изменить стандартные пресеты" на экране "🔔 Уведомления" —
+    что автоматически отмечается в меню напоминаний у КАЖДОЙ новой задачи
+    (см. handlers/tasks.py::_apply_default_reminders)."""
+    selected = set(await get_default_reminder_offsets(callback.from_user.id))
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.default_reminder_presets_text(sorted(selected, key=lambda o: list(ReminderOffset).index(o))),
+        reply_markup=default_reminder_presets_keyboard(selected).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("defrmd_toggle:"))
+async def defrmd_toggle(callback: CallbackQuery) -> None:
+    """Клик по одному чекбоксу на экране стандартных пресетов — сразу
+    сохраняет в БД, та же мгновенная модель, что и у rmd_toggle/notif_toggle."""
+    offset = ReminderOffset(callback.data.split(":", maxsplit=1)[1])
+    selected = set(await get_default_reminder_offsets(callback.from_user.id))
+
+    if offset in selected:
+        selected.discard(offset)
+    else:
+        selected.add(offset)
+
+    await set_default_reminder_offsets(callback.from_user.id, list(selected))
+    await callback.answer("Обновлено ✅")
+    await callback.message.edit_text(
+        texts.default_reminder_presets_text(sorted(selected, key=lambda o: list(ReminderOffset).index(o))),
+        reply_markup=default_reminder_presets_keyboard(selected).as_markup(),
+    )
+
+
+@router.callback_query(F.data == "defrmd_back")
+async def defrmd_back(callback: CallbackQuery) -> None:
+    """"◀️ Назад к уведомлениям" — возвращает обычный экран "🔔 Уведомления"."""
+    await notif_open(callback)
 
 
 # --- Экран "🌍 Часовой пояс" -----------------------------------------------------
