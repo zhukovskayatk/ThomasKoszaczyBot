@@ -20,6 +20,7 @@ from texts import (
     REMINDER_OFFSET_LABELS,
     URGENCY_MARKERS,
     button_deadline_suffix,
+    format_utc_offset,
     task_urgency_category,
 )
 
@@ -709,12 +710,34 @@ def profile_actions_keyboard() -> InlineKeyboardBuilder:
     - profile_partner → handlers/partner.py::show_partner_screen
     - notif_open → handlers/profile.py::notif_open (без изменений)
     - profile_premium → handlers/subscription.py::show_premium_screen
+    - tz_open → handlers/profile.py::tz_open (личный часовой пояс,
+      см. timezone_settings_keyboard ниже)
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="👥 Мой партнёр", callback_data="profile_partner")
     builder.button(text="🔔 Уведомления", callback_data="notif_open")
     builder.button(text="💎 Подписка", callback_data="profile_premium")
-    builder.adjust(2, 1)
+    builder.button(text="🌍 Часовой пояс", callback_data="tz_open")
+    builder.adjust(2, 2)
+    return builder
+
+
+def timezone_settings_keyboard(offset_minutes: int) -> InlineKeyboardBuilder:
+    """
+    Экран "🌍 Часовой пояс" (Профиль и Настройки → 🌍 Часовой пояс) —
+    степпер ➖/➕ по часу за клик (та же идея, что и часы в
+    time_drum_keyboard), значение меняется сразу через
+    edit_message_reply_markup, без отдельной кнопки "Сохранить" (см.
+    handlers/profile.py::tz_adjust). Границы — services.timeutils.
+    MIN_OFFSET_MINUTES/MAX_OFFSET_MINUTES, кнопка на границе просто не
+    выходит за неё (шаг тогда ничего не меняет, но и не ломается).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➖ 1 ч", callback_data="tz_adjust:-60")
+    builder.button(text=format_utc_offset(offset_minutes), callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 1 ч", callback_data="tz_adjust:60")
+    builder.button(text="◀️ Назад к профилю", callback_data="tz_back")
+    builder.adjust(3, 1)
     return builder
 
 

@@ -912,6 +912,41 @@ def profile_actions_text() -> str:
     return "⚙️ Ещё немного настроек:"
 
 
+def format_utc_offset(minutes: int) -> str:
+    """
+    Короткая подпись смещения часового пояса, например "UTC+3" или
+    "UTC−4". Специально не привязываемся к конкретным городам/названиям
+    зон (Europe/Moscow и т.п.) — человеку достаточно понимать смещение от
+    UTC, а не разбираться в базе IANA; "(например, Москва)" добавляется
+    отдельно только для самого частого случая (UTC+3), см.
+    timezone_settings_text.
+    """
+    sign = "+" if minutes >= 0 else "−"
+    hours, mins = divmod(abs(minutes), 60)
+    if mins:
+        return f"UTC{sign}{hours}:{mins:02d}"
+    return f"UTC{sign}{hours}"
+
+
+def timezone_settings_text(offset_minutes: int) -> str:
+    """
+    Экран "🌍 Часовой пояс" (Профиль и Настройки → 🌍 Часовой пояс, см.
+    handlers/profile.py::tz_open/tz_adjust) — объясняет, зачем это вообще
+    нужно, и показывает текущее значение. Степпер ➖/➕ на клавиатуре (см.
+    keyboards.timezone_settings_keyboard) меняет его сразу, без отдельной
+    кнопки "Сохранить".
+    """
+    hint = " (например, Москва)" if offset_minutes == 180 else ""
+    return (
+        "🌍 <b>Часовой пояс</b>\n"
+        "От него зависит, во сколько РЕАЛЬНО приходят напоминания и "
+        "утренние/вечерние сводки — по умолчанию бот считал время по "
+        "часовому поясу сервера, а не твоему, отсюда и путаница со "
+        "временем.\n\n"
+        f"Сейчас выбрано: <b>{format_utc_offset(offset_minutes)}</b>{hint}"
+    )
+
+
 def notifications_settings_text() -> str:
     """
     Заголовок экрана "🔔 Уведомления" (Профиль и Настройки → 🔔 Уведомления,

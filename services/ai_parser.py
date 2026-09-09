@@ -93,20 +93,31 @@ def _system_prompt(now: datetime) -> str:
     )
 
 
-async def parse_task_message(text: str) -> ParsedTask | None:
+async def parse_task_message(text: str, now: datetime | None = None) -> ParsedTask | None:
     """
     Пытается распознать название/дедлайн/приоритет из сообщения.
     Возвращает None при любой проблеме (ключ не задан, нет сети, ИИ вернул
     что-то нечитаемое) — вызывающий код должен воспринимать это как
     "распознавание недоступно сейчас", а не как ошибку.
+
+    now — момент, который ИИ должен считать "сейчас" при разборе
+    относительных дат ("завтра", "через 2 часа"): вызывающий код
+    (handlers/tasks.py::_create_task_with_ai) передаёт сюда ЛИЧНОЕ "сейчас"
+    автора сообщения (см. services/timeutils.py::user_now), а не время
+    сервера — иначе "завтра" ИИ мог бы посчитать от чужого часового пояса.
+    Возвращённый parsed.deadline при этом остаётся в ТОМ ЖЕ часовом поясе,
+    что и переданный now — конвертация в серверное время для сохранения
+    остаётся на вызывающем коде.
     """
     if not settings.deepseek_api_key:
         return None
 
+    reference_now = now if now is not None else datetime.now()
+
     payload = {
         "model": _MODEL,
         "messages": [
-            {"role": "system", "content": _system_prompt(datetime.now())},
+            {"role": "system", "content": _system_prompt(reference_now)},
             {"role": "user", "content": text},
         ],
         "response_format": {"type": "json_object"},

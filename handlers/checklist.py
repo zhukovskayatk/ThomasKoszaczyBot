@@ -53,6 +53,7 @@ from keyboards import (
     checklist_edit_keyboard,
     habit_delete_confirm_keyboard,
 )
+from services import timeutils
 from services.task_actions import complete_task_core
 
 router = Router(name="checklist")
@@ -65,18 +66,24 @@ _pending_add: dict[int, tuple[str, str]] = {}
 
 async def _dashboard_payload(user_id: int):
     """Текст + инлайн-клавиатура главного экрана чек-листа — общая сборка
-    для всех мест, которые его показывают/перерисовывают."""
+    для всех мест, которые его показывают/перерисовывают. Дедлайны задач
+    переводятся в личный часовой пояс user_id перед отрисовкой (см.
+    services/timeutils.py) — иначе точное время на кнопке (например,
+    "18:15") показывалось бы по времени сервера."""
     habits = await get_visible_habits_today(user_id)
     tasks = await get_checklist_tasks_for_today(user_id)
+    timeutils.localize_tasks(tasks, await timeutils.viewer_offset_minutes(user_id))
     return texts.checklist_dashboard_text(habits, tasks), checklist_dashboard_keyboard(habits, tasks).as_markup()
 
 
 async def _edit_payload(user_id: int):
     """Текст + инлайн-клавиатура экрана "⚙️ Настроить фокус дня" — в
     отличие от главного экрана здесь показываются ВСЕ привычки, включая
-    временно скрытые (иначе их нельзя было бы вернуть обратно)."""
+    временно скрытые (иначе их нельзя было бы вернуть обратно). См.
+    _dashboard_payload про перевод дедлайнов в личный часовой пояс."""
     habits = await get_habits(user_id)
     tasks = await get_checklist_tasks_for_today(user_id)
+    timeutils.localize_tasks(tasks, await timeutils.viewer_offset_minutes(user_id))
     return texts.checklist_edit_screen_text(), checklist_edit_keyboard(habits, tasks).as_markup()
 
 
@@ -232,6 +239,7 @@ async def chked_hhide(callback: CallbackQuery) -> None:
     await callback.answer("Скрыто на сегодня" if habit.hidden_today else "Снова видно")
     habits = await get_habits(callback.from_user.id)
     tasks = await get_checklist_tasks_for_today(callback.from_user.id)
+    timeutils.localize_tasks(tasks, await timeutils.viewer_offset_minutes(callback.from_user.id))
     await callback.message.edit_reply_markup(reply_markup=checklist_edit_keyboard(habits, tasks).as_markup())
 
 
@@ -290,6 +298,7 @@ async def chked_trm(callback: CallbackQuery) -> None:
     await callback.answer("Убрано из чек-листа 🚫")
     habits = await get_habits(user_id)
     tasks = await get_checklist_tasks_for_today(user_id)
+    timeutils.localize_tasks(tasks, await timeutils.viewer_offset_minutes(user_id))
     await callback.message.edit_reply_markup(reply_markup=checklist_edit_keyboard(habits, tasks).as_markup())
 
 

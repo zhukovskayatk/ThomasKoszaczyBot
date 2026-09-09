@@ -198,6 +198,18 @@ class User(Base):
     # перестаёт работать.
     partner_invite_code: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # --- Личный часовой пояс (настройка "🌍 Часовой пояс" в Профиле) --------
+    # Смещение от UTC в минутах (например, 180 — это UTC+3, Москва). Раньше
+    # бот везде считал время по системному часовому поясу СЕРВЕРА
+    # (datetime.now()) — если он не совпадал с реальным часовым поясом
+    # человека, дедлайны и напоминания срабатывали "по серверу", то есть на
+    # деле в чужом часе. См. services/timeutils.py — там же и весь перевод
+    # между "серверным" временем (как всё хранится и планируется, без
+    # изменений) и личным часовым поясом каждого пользователя. По умолчанию
+    # UTC+3 (Москва) — самый частый случай для этого бота, каждый может
+    # сменить его под себя (например, если в отъезде).
+    utc_offset_minutes: Mapped[int] = mapped_column(default=180)
+
     # Связь "один пользователь — много задач"
     tasks: Mapped[list["Task"]] = relationship(back_populates="user")
 
@@ -390,6 +402,10 @@ async def _migrate_missing_columns(conn) -> None:
         await conn.exec_driver_sql("ALTER TABLE users ADD COLUMN premium_until DATETIME")
     if "partner_invite_code" not in existing_user_columns:
         await conn.exec_driver_sql("ALTER TABLE users ADD COLUMN partner_invite_code TEXT")
+    if "utc_offset_minutes" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN utc_offset_minutes INTEGER NOT NULL DEFAULT 180"
+        )
 
     result = await conn.exec_driver_sql("PRAGMA table_info(tasks)")
     existing_task_columns = {row[1] for row in result.fetchall()}

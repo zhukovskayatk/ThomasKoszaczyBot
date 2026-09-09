@@ -62,6 +62,7 @@ from database.requests import (
     get_streak_status,
     get_task,
     get_task_reminders,
+    get_user,
     has_effective_premium,
     recompute_reminders_for_new_deadline,
     remove_reminder,
@@ -100,7 +101,7 @@ from keyboards import (
     time_drum_keyboard,
 )
 from handlers import checklist
-from services import ai_parser
+from services import ai_parser, timeutils
 from services.meme_manager import get_success_reward
 from services.task_actions import complete_task_core
 
@@ -209,6 +210,11 @@ async def show_tasks(message: Message, task_filter: str = TASKS_FILTER_ALL) -> N
         await message.answer(texts.no_tasks_in_filter_text(task_filter), reply_markup=main_menu_keyboard)
         return
 
+    # Переводим дедлайны в личный часовой пояс viewer'а ПЕРЕД рендерингом —
+    # общие задачи партнёра при этом показываются в ЕГО СОБСТВЕННЫХ часах,
+    # как в любом обычном календаре (см. services/timeutils.py).
+    timeutils.localize_tasks(filtered, await _user_offset(user_id))
+
     keyboard, offset = tasks_page_keyboard(
         filtered, offset=0, viewer_user_id=user_id,
         task_filter=task_filter, show_filter_tabs=show_filter_tabs, filter_counts=counts,
@@ -217,6 +223,12 @@ async def show_tasks(message: Message, task_filter: str = TASKS_FILTER_ALL) -> N
         texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=task_filter if show_filter_tabs else None),
         reply_markup=keyboard.as_markup(),
     )
+
+
+async def _user_offset(user_id: int) -> int:
+    """Личный часовой пояс пользователя (см. services/timeutils.py) —
+    короткий алиас под самое частое использование в этом модуле."""
+    return await timeutils.viewer_offset_minutes(user_id)
 
 
 async def _task_card_extras(task, viewer_user_id: int) -> tuple[bool, bool]:
@@ -240,18 +252,27 @@ async def _task_card_extras(task, viewer_user_id: int) -> tuple[bool, bool]:
     return False, can_toggle_shared
 
 
-def _default_time_for_date(year: int, month: int, day: int) -> tuple[int, int]:
+def _default_time_for_date(year: int, month: int, day: int, tz_offset_minutes: int) -> tuple[int, int]:
     """
     Разумное время по умолчанию при переходе на шаг выбора времени:
-    - если выбран сегодняшний день — берём текущее время, округлённое
-      вверх до ближайших 15 минут (шаг минутной кнопки "➕/➖ 15 м" —
-      тоже 15, чтобы значение по умолчанию сразу попадало в его сетку);
+    - если выбран сегодняшний день — берём текущее время (в ЛИЧНОМ
+      часовом поясе того, кто выбирает — см. services/timeutils.py),
+      округлённое вверх до ближайших 15 минут (шаг минутной кнопки
+      "➕/➖ 15 м" — тоже 15, чтобы значение по умолчанию сразу попадало в
+      его сетку);
     - иначе — полдень (12:00), нейтральный вариант.
+
+    Само "какой сегодня день" здесь намеренно сравнивается по дате
+    СЕРВЕРА (date.today()), а не личной дате — календарь и пресеты вообще
+    выбирают ДЕНЬ по серверному "сегодня" (это отдельный, сознательно не
+    затронутый этой настройкой нюанс — расхождение возможно только в
+    считанные часы вокруг полуночи). Переводу часового пояса подвергается
+    только ЧАС, который человек всё равно может поправить кнопками ниже.
     """
     if date(year, month, day) != date.today():
         return 12, 0
 
-    now = datetime.now()
+    now = timeutils.user_now(tz_offset_minutes)
     total_minutes = now.hour * 60 + now.minute
     rounded = min(((total_minutes // 15) + 1) * 15, 23 * 60 + 45)
     return divmod(rounded, 60)
@@ -301,6 +322,7 @@ async def _offer_sharing_or_finish(callback: CallbackQuery, task) -> None:
     не дублируем, сразу показываем итог.
     """
     user_id = callback.from_user.id
+    timeutils.localize_task(task, await _user_offset(user_id))
 
     if task.shared:
         await _finish_wizard(
@@ -354,6 +376,7 @@ async def share_choice(callback: CallbackQuery) -> None:
     await callback.answer("Готово! 🎉")
     if task.shared:
         await _notify_partner_shared(callback.bot, user_id, task.title)
+    timeutils.localize_task(task, await _user_offset(user_id))
     await _finish_wizard(
         callback,
         texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day, shared=task.shared),
@@ -412,6 +435,8 @@ async def tasks_page(callback: CallbackQuery) -> None:
         await callback.message.edit_text(texts.no_tasks_in_filter_text(task_filter))
         await callback.answer()
         return
+
+    timeutils.localize_tasks(filtered, await _user_offset(user_id))
 
     keyboard, offset = tasks_page_keyboard(
         filtered, offset, viewer_user_id=user_id,
@@ -654,6 +679,7 @@ async def add_task_from_text(message: Message) -> None:
         task = await get_task(task_id=pending_task_id, user_id=user_id)
         reminders = await get_task_reminders(pending_task_id)
         shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
+        timeutils.localize_task(task, await _user_offset(user_id))
         await message.answer(
             "✅ Текст обновлён!\n\n" + texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
             reply_markup=task_card_keyboard(
@@ -679,13 +705,13 @@ async def _create_task_with_ai(message: Message, task) -> None:
     ведём себя как раньше: показываем обычное подтверждение с выбором
     приоритета (confirm_task_added).
     """
-    parsed = await ai_parser.parse_task_message(message.text)
+    user_id = task.user_id
+    tz_offset = await _user_offset(user_id)
+    parsed = await ai_parser.parse_task_message(message.text, now=timeutils.user_now(tz_offset))
 
     if parsed is None:
         await confirm_task_added(message, task)
         return
-
-    user_id = task.user_id
 
     if parsed.is_shared:
         # ИИ сама услышала "мы"/"нам"/"вместе"/"партнёру" в тексте — но
@@ -706,8 +732,14 @@ async def _create_task_with_ai(message: Message, task) -> None:
         await set_task_priority(task_id=task.task_id, user_id=user_id, priority=parsed.priority)
 
     if parsed.deadline is not None:
+        # parsed.deadline пришёл от ИИ в ЛИЧНОМ часовом поясе автора (см.
+        # now= выше) — переводим в серверный перед сохранением, ровно как
+        # и обычный дедлайн из календаря/барабана времени (см. td_confirm).
+        # Задачи "☀️ В течение дня" (all_day) — вне масштаба этого перевода
+        # (см. services/timeutils.py::localize_task), сохраняем как есть.
+        stored_deadline = parsed.deadline if parsed.all_day else timeutils.to_server(parsed.deadline, tz_offset)
         await set_task_deadline(
-            task_id=task.task_id, user_id=user_id, deadline=parsed.deadline, all_day=parsed.all_day
+            task_id=task.task_id, user_id=user_id, deadline=stored_deadline, all_day=parsed.all_day
         )
 
     task = await get_task(task_id=task.task_id, user_id=user_id)
@@ -720,6 +752,7 @@ async def _create_task_with_ai(message: Message, task) -> None:
         # process_priority_choice сам это обнаружит и пропустит пресеты
         # срока, сразу перейдя к напоминаниям.
         if parsed.deadline is not None:
+            timeutils.localize_task(task, tz_offset)
             intro = (
                 "🤖 Заметила дату в сообщении.\n"
                 + texts.task_added_text(task.title, task.priority)
@@ -734,7 +767,12 @@ async def _create_task_with_ai(message: Message, task) -> None:
     intro = "🤖 Распознала из сообщения:\n" + texts.task_added_text(task.title, task.priority)
 
     if task.deadline is not None:
+        # available_reminder_offsets ДО localize_task — ей нужен ещё
+        # "серверный" дедлайн (сравнение идёт с datetime.now(), см.
+        # database/requests.py), иначе доступность вариантов посчиталась
+        # бы неверно.
         available_offsets = available_reminder_offsets(task.deadline)
+        timeutils.localize_task(task, tz_offset)
         await message.answer(
             intro + f"\n⏳ <i>Срок: {texts.format_deadline(task.deadline, task.deadline_all_day)}</i>",
             reply_markup=reminders_keyboard(CTX_NEW, task.task_id, available_offsets, set()).as_markup(),
@@ -774,6 +812,7 @@ async def process_priority_choice(callback: CallbackQuery) -> None:
         # пресеты срока тут ни к чему, сразу переходим к напоминаниям, как
         # будто дедлайн только что выбрали в календаре.
         available_offsets = available_reminder_offsets(task.deadline)
+        timeutils.localize_task(task, await _user_offset(callback.from_user.id))
         await callback.message.edit_text(
             texts.reminders_prompt_text(task.title, task.deadline, task.deadline_all_day),
             reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, set()).as_markup(),
@@ -863,6 +902,7 @@ async def wiz_cancel(callback: CallbackQuery) -> None:
     await callback.answer("Отменено")
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
+    timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await _finish_wizard(
         callback,
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
@@ -938,7 +978,10 @@ async def preset_day(callback: CallbackQuery) -> None:
 
     target_date = _resolve_preset_date(code)
     await callback.answer()
-    default_hour, default_minute = _default_time_for_date(target_date.year, target_date.month, target_date.day)
+    tz_offset = await _user_offset(callback.from_user.id)
+    default_hour, default_minute = _default_time_for_date(
+        target_date.year, target_date.month, target_date.day, tz_offset
+    )
     await callback.message.edit_text(
         texts.time_prompt_text(task.title, target_date.day, target_date.month, target_date.year),
         reply_markup=time_drum_keyboard(
@@ -979,7 +1022,8 @@ async def cal_day(callback: CallbackQuery) -> None:
         title = task.title
 
     await callback.answer()
-    default_hour, default_minute = _default_time_for_date(year, month, day)
+    tz_offset = await _user_offset(callback.from_user.id)
+    default_hour, default_minute = _default_time_for_date(year, month, day, tz_offset)
     await callback.message.edit_text(
         texts.time_prompt_text(title, day, month, year),
         reply_markup=time_drum_keyboard(
@@ -1151,15 +1195,23 @@ async def td_confirm(callback: CallbackQuery) -> None:
     )
     entity_id, year, month, day = int(entity_id_str), int(year_str), int(month_str), int(day_str)
     hour, minute = int(hour_str), int(minute_str)
+    # chosen — то, что человек ЛИЧНО выбрал на экране, в ЕГО часовом
+    # поясе (см. services/timeutils.py). Для хранения/планирования нужен
+    # отдельный, переведённый в серверное время вариант (server_chosen) —
+    # само сравнение "уже прошло?" и отображение подтверждения при этом
+    # остаются в личном времени, как человек его и видит.
+    tz_offset = await _user_offset(callback.from_user.id)
     chosen = datetime(year, month, day, hour, minute)
 
-    if chosen <= datetime.now():
+    if chosen <= timeutils.user_now(tz_offset):
         await callback.answer("Это время уже прошло — выбери время в будущем 🙂", show_alert=True)
         return
 
+    server_chosen = timeutils.to_server(chosen, tz_offset)
+
     if context == CTX_SNOOZE:
         reminder_id = entity_id
-        ok = await scheduler_service.reschedule(reminder_id, chosen)
+        ok = await scheduler_service.reschedule(reminder_id, server_chosen)
         if not ok:
             await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
             return
@@ -1170,14 +1222,14 @@ async def td_confirm(callback: CallbackQuery) -> None:
     task_id, user_id = entity_id, callback.from_user.id
 
     if context == CTX_NEW:
-        await set_task_deadline(task_id=task_id, user_id=user_id, deadline=chosen, all_day=False)
+        await set_task_deadline(task_id=task_id, user_id=user_id, deadline=server_chosen, all_day=False)
         task = await get_task(task_id=task_id, user_id=user_id)
         if task is None:
             await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
             return
 
         await callback.answer("Дедлайн сохранён ✅")
-        available_offsets = available_reminder_offsets(chosen)
+        available_offsets = available_reminder_offsets(server_chosen)
         await callback.message.edit_text(
             texts.reminders_prompt_text(task.title, chosen),
             reply_markup=reminders_keyboard(CTX_NEW, task_id, available_offsets, selected_offsets=set()).as_markup(),
@@ -1185,11 +1237,11 @@ async def td_confirm(callback: CallbackQuery) -> None:
         return
 
     # CTX_EDIT — правка даты/времени уже существующей задачи из карточки.
-    await set_task_deadline(task_id=task_id, user_id=user_id, deadline=chosen, all_day=False)
-    kept, removed_offsets = await recompute_reminders_for_new_deadline(task_id, chosen)
+    await set_task_deadline(task_id=task_id, user_id=user_id, deadline=server_chosen, all_day=False)
+    kept, removed_offsets = await recompute_reminders_for_new_deadline(task_id, server_chosen)
 
-    for offset in removed_offsets:
-        scheduler_service.unschedule_reminder(task_id, offset)
+    for removed_offset in removed_offsets:
+        scheduler_service.unschedule_reminder(task_id, removed_offset)
     for reminder in kept:
         await scheduler_service.schedule_reminder(task_id, reminder.offset, reminder.reminder_id, reminder.remind_at)
 
@@ -1201,6 +1253,7 @@ async def td_confirm(callback: CallbackQuery) -> None:
     await callback.answer("Дедлайн обновлён ✅")
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
+    timeutils.localize_task(task, tz_offset)
     await _finish_wizard(
         callback,
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
@@ -1301,6 +1354,7 @@ async def rmd_done(callback: CallbackQuery) -> None:
 
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
+    timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await _finish_wizard(
         callback,
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
@@ -1325,6 +1379,7 @@ async def card_open(callback: CallbackQuery) -> None:
 
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
+    timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await callback.answer()
     await callback.message.edit_text(
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
@@ -1379,6 +1434,7 @@ async def card_remind(callback: CallbackQuery) -> None:
     await callback.answer()
     current_offsets = {reminder.offset for reminder in await get_task_reminders(task_id)}
     offsets_available_now = available_reminder_offsets(task.deadline)
+    timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await callback.message.edit_text(
         texts.reminders_prompt_text(task.title, task.deadline, task.deadline_all_day),
         reply_markup=reminders_keyboard(CTX_EDIT, task_id, offsets_available_now, current_offsets).as_markup(),
@@ -1503,6 +1559,7 @@ async def card_delno(callback: CallbackQuery) -> None:
     await callback.answer("Отменено")
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
+    timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await callback.message.edit_text(
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
         reply_markup=task_card_keyboard(
@@ -1533,6 +1590,7 @@ async def card_toggle_shared(callback: CallbackQuery) -> None:
         await _notify_partner_shared(callback.bot, user_id, task.title)
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
+    timeutils.localize_task(task, await _user_offset(user_id))
     await callback.message.edit_text(
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
         reply_markup=task_card_keyboard(
@@ -1575,32 +1633,40 @@ async def snz_quick(callback: CallbackQuery) -> None:
     _, reminder_id_str, task_id_str, minutes_str = callback.data.split(":", maxsplit=3)
     reminder_id, minutes = int(reminder_id_str), int(minutes_str)
 
+    # Относительный сдвиг от текущего РЕАЛЬНОГО момента — часовые пояса
+    # тут ни при чём, new_time остаётся "серверным" для планировщика как
+    # и раньше (см. services/timeutils.py). Личный часовой пояс нужен
+    # только для того, ЧТО написать в подтверждении.
     new_time = datetime.now() + timedelta(minutes=minutes)
     ok = await scheduler_service.reschedule(reminder_id, new_time)
     if not ok:
         await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
         return
 
+    tz_offset = await _user_offset(callback.from_user.id)
     await callback.answer("Перенесено ⏰")
-    await callback.message.edit_text(texts.snooze_confirmed_text(new_time))
+    await callback.message.edit_text(texts.snooze_confirmed_text(timeutils.to_user(new_time, tz_offset)))
 
 
 @router.callback_query(F.data.startswith("snz_tmr:"))
 async def snz_tmr(callback: CallbackQuery) -> None:
-    """Перенос "на завтра утро (09:00)" / "на завтра вечер (18:00)"."""
+    """Перенос "на завтра утро (09:00)" / "на завтра вечер (18:00)" — оба
+    момента личные (по часовому поясу того, кто отложил), переводятся в
+    серверное время только для самой постановки таймера."""
     _, reminder_id_str, task_id_str, hour_str, minute_str = callback.data.split(":", maxsplit=4)
     reminder_id, hour, minute = int(reminder_id_str), int(hour_str), int(minute_str)
 
-    tomorrow = date.today() + timedelta(days=1)
-    new_time = datetime.combine(tomorrow, datetime.min.time()).replace(hour=hour, minute=minute)
+    tz_offset = await _user_offset(callback.from_user.id)
+    tomorrow_local = timeutils.user_now(tz_offset).date() + timedelta(days=1)
+    chosen_local = datetime.combine(tomorrow_local, datetime.min.time()).replace(hour=hour, minute=minute)
 
-    ok = await scheduler_service.reschedule(reminder_id, new_time)
+    ok = await scheduler_service.reschedule(reminder_id, timeutils.to_server(chosen_local, tz_offset))
     if not ok:
         await callback.answer("Не удалось найти это напоминание 🤔", show_alert=True)
         return
 
     await callback.answer("Перенесено ⏰")
-    await callback.message.edit_text(texts.snooze_confirmed_text(new_time))
+    await callback.message.edit_text(texts.snooze_confirmed_text(chosen_local))
 
 
 @router.callback_query(F.data.startswith("snz_custom:"))
@@ -1637,6 +1703,7 @@ async def snz_cancel(callback: CallbackQuery) -> None:
         return
     reminder, task = found
 
+    timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await callback.answer()
     await callback.message.edit_text(
         texts.reminder_notification_text(task, reminder.offset),
@@ -1660,6 +1727,7 @@ async def remind_open_card(callback: CallbackQuery) -> None:
 
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
+    timeutils.localize_task(task, await _user_offset(callback.from_user.id))
     await callback.answer()
     await callback.message.edit_text(
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),

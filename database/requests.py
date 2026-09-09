@@ -1285,10 +1285,58 @@ async def reset_daily_habits() -> None:
     """
     Полуночный сброс ВСЕХ привычек всех пользователей разом: done_today и
     hidden_today возвращаются в False — новый день начинается с чистого
-    листа (см. services.scheduler._reset_daily_habits, cron-job в 00:00).
-    Именно за счёт этого сброса привычки не нужно пересоздавать каждый
-    день вручную — это и есть автономность модуля.
+    листа. Именно за счёт этого сброса привычки не нужно пересоздавать
+    каждый день вручную — это и есть автономность модуля. Оставлена как
+    есть на случай ручного/административного использования — сам
+    планировщик теперь сбрасывает каждого пользователя ОТДЕЛЬНО, в его
+    личную полночь (см. reset_daily_habits_for_user ниже и
+    services.scheduler._daily_ticker).
     """
     async with async_session() as session:
         await session.execute(update(Habit).values(done_today=False, hidden_today=False))
         await session.commit()
+
+
+async def reset_daily_habits_for_user(user_id: int) -> None:
+    """
+    Тот же сброс, что и reset_daily_habits(), но только для ОДНОГО
+    пользователя — используется полуночным тиком планировщика (см.
+    services.scheduler._daily_ticker), который проверяет полночь в личном
+    часовом поясе КАЖДОГО пользователя по отдельности (User.utc_offset_minutes),
+    а не разом для всех сразу в один момент времени сервера, как было
+    раньше.
+    """
+    async with async_session() as session:
+        await session.execute(
+            update(Habit).where(Habit.user_id == user_id).values(done_today=False, hidden_today=False)
+        )
+        await session.commit()
+
+
+async def get_all_users() -> list[User]:
+    """Все зарегистрированные пользователи — используется полуночным тиком
+    планировщика для сброса привычек в ЛИЧНУЮ полночь каждого (см.
+    services.scheduler._daily_ticker)."""
+    async with async_session() as session:
+        result = await session.execute(select(User))
+        return list(result.scalars().all())
+
+
+async def set_user_utc_offset(user_id: int, minutes: int) -> User | None:
+    """
+    Устанавливает личный часовой пояс пользователя (настройка "🌍 Часовой
+    пояс" в Профиле, см. handlers/profile.py::tz_adjust) — смещение от UTC
+    в минутах, см. User.utc_offset_minutes/services/timeutils.py. minutes
+    подрезается в разумные границы (timeutils.MIN_OFFSET_MINUTES/
+    MAX_OFFSET_MINUTES) на случай, если кто-то дотыкается степпер до края.
+    """
+    from services import timeutils  # локальный импорт — без цикла (timeutils сам импортирует из этого модуля)
+
+    clamped = max(timeutils.MIN_OFFSET_MINUTES, min(timeutils.MAX_OFFSET_MINUTES, minutes))
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return None
+        user.utc_offset_minutes = clamped
+        await session.commit()
+        return user

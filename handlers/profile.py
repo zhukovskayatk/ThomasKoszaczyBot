@@ -24,6 +24,7 @@ from database.requests import (
     get_streak_status,
     get_user,
     rescue_streak_with_xp,
+    set_user_utc_offset,
     toggle_checklist_evening_push_enabled,
     toggle_checklist_morning_push_enabled,
     toggle_morning_checklist_enabled,
@@ -37,6 +38,7 @@ from keyboards import (
     notification_settings_keyboard,
     profile_actions_keyboard,
     streak_rescue_keyboard,
+    timezone_settings_keyboard,
 )
 from services.leveling import get_level_info
 
@@ -206,6 +208,54 @@ async def notif_toggle(callback: CallbackQuery) -> None:
             user.checklist_evening_push_enabled,
         ).as_markup()
     )
+
+
+# --- Экран "🌍 Часовой пояс" -----------------------------------------------------
+
+@router.callback_query(F.data == "tz_open")
+async def tz_open(callback: CallbackQuery) -> None:
+    """Кнопка "🌍 Часовой пояс" под карточкой профиля — от него зависит,
+    во сколько РЕАЛЬНО приходят напоминания и утренние/вечерние сводки
+    (см. services/timeutils.py)."""
+    user = await get_or_create_user(
+        user_id=callback.from_user.id,
+        username=callback.from_user.username,
+    )
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.timezone_settings_text(user.utc_offset_minutes),
+        reply_markup=timezone_settings_keyboard(user.utc_offset_minutes).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("tz_adjust:"))
+async def tz_adjust(callback: CallbackQuery) -> None:
+    """Клик по ➖/➕ 1 ч — сразу меняет значение в БД и перерисовывает
+    экран на месте (edit_message_text/edit_message_reply_markup), без
+    отдельной кнопки "Сохранить" — та же идея, что и у переключателей
+    уведомлений (notif_toggle)."""
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    user = await get_user(callback.from_user.id)
+    current = user.utc_offset_minutes if user is not None else 180
+
+    updated = await set_user_utc_offset(callback.from_user.id, current + delta)
+    if updated is None:
+        await callback.answer("Не удалось найти профиль 🤔", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.timezone_settings_text(updated.utc_offset_minutes),
+        reply_markup=timezone_settings_keyboard(updated.utc_offset_minutes).as_markup(),
+    )
+
+
+@router.callback_query(F.data == "tz_back")
+async def tz_back(callback: CallbackQuery) -> None:
+    """"◀️ Назад к профилю" — экран часового пояса был отдельным
+    сообщением (см. tz_open), просто убираем его, как и notif_back."""
+    await callback.answer()
+    await callback.message.delete()
 
 
 @router.callback_query(F.data == "notif_back")
