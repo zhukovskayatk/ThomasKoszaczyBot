@@ -118,6 +118,13 @@ def _date_ru(moment) -> str:
     return f"{moment.day} {_MONTHS_GENITIVE_RU[moment.month]} {moment.year}"
 
 
+# Публичный алиас _date_ru — используется за пределами этого модуля там,
+# где не нужен весь текстовый экран целиком, а нужна только сама дата
+# (см. handlers/admin.py — короткие технические ответы на /grant_premium
+# и /check_premium, не часть основного пользовательского ToV).
+date_ru = _date_ru
+
+
 def premium_status_text(is_active: bool, premium_until, price_stars: int, duration_days: int) -> str:
     """Экран "💎 Premium" — статус подписки + приглашение оформить/продлить."""
     if is_active:

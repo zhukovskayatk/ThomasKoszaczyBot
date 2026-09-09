@@ -296,6 +296,48 @@ async def extend_premium(user_id: int, days: int = 30) -> datetime:
         return user.premium_until
 
 
+# Дата "бесконечного" Premium для ручных исключений (см. grant_lifetime_premium)
+# — просто далёкое будущее, а не отдельный флаг "is_lifetime": is_premium_active
+# как обычно сравнивает premium_until с datetime.now(), никакой отдельной
+# ветки логики под "вечный" Premium не нужно вообще нигде в коде.
+_LIFETIME_PREMIUM_UNTIL = datetime(2099, 1, 1)
+
+
+async def grant_lifetime_premium(user_id: int) -> datetime:
+    """
+    Выдаёт Premium "навсегда" вручную — единственный способ сделать
+    личное исключение для конкретного человека (см. handlers/admin.py::
+    cmd_grant_premium, доступно только владелице бота). Не отдельная
+    система прав, а просто premium_until в очень далёком будущем — так
+    это исключение автоматически участвует во всех проверках Premium
+    (партнёрский режим и т.д.) наравне с обычной платной подпиской.
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            user = User(user_id=user_id)
+            session.add(user)
+        user.premium_until = _LIFETIME_PREMIUM_UNTIL
+        await session.commit()
+        return _LIFETIME_PREMIUM_UNTIL
+
+
+async def revoke_premium(user_id: int) -> bool:
+    """
+    Снимает Premium немедленно (и оплаченный, и выданный вручную через
+    grant_lifetime_premium/extend_premium) — обратная операция для
+    /revoke_premium (см. handlers/admin.py). Возвращает False, если
+    пользователь не найден вообще.
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return False
+        user.premium_until = None
+        await session.commit()
+        return True
+
+
 # --- Партнёрский режим (экран "👥 Партнёр", Premium-фича) -----------------------
 #
 # Пара хранится максимально просто, без отдельной таблицы: у обоих

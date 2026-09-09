@@ -14,6 +14,12 @@
 4. Поле deepseek_api_key — необязательное (по умолчанию None): без него
    бот просто не пытается распознавать дату/приоритет из свободного текста
    (см. services/ai_parser.py) и работает как раньше, без ИИ.
+5. Поле owner_user_id — Telegram user_id владелицы бота. Используется
+   ТОЛЬКО для проверки доступа к скрытым командам /grant_premium и
+   /revoke_premium (см. handlers/admin.py) — специально хранится в .env,
+   а не в коде, чтобы не светить свой Telegram id в публичном репозитории
+   на GitHub. Если поле не задано — обе команды просто ничего не делают
+   ни для кого (безопасный вариант по умолчанию, а не "открыто всем").
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +33,10 @@ class Settings(BaseSettings):
     # (см. services/ai_parser.py). Необязателен — если не задан, эта
     # функция просто тихо выключена.
     deepseek_api_key: str | None = None
+
+    # Telegram user_id владелицы бота — единственный, кому доступны
+    # /grant_premium и /revoke_premium (см. handlers/admin.py).
+    owner_user_id: int | None = None
 
     # Настройки поиска .env файла (регистр переменных не важен:
     # BOT_TOKEN, bot_token — будет найдено одинаково)

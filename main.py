@@ -21,7 +21,7 @@ from aiogram.types import BotCommand
 
 from config import settings
 from database.models import init_db
-from handlers import checklist, dev_tools, partner, profile, start, subscription, tasks
+from handlers import admin, checklist, dev_tools, partner, profile, start, subscription, tasks
 from services.scheduler import init_scheduler, resync_reminders
 
 
@@ -63,6 +63,7 @@ async def main() -> None:
     # отдельные типы апдейтов, их порядок относительно остальных роутеров
     # не важен.
     dp.include_router(start.router)
+    dp.include_router(admin.router)
     dp.include_router(profile.router)
     dp.include_router(checklist.router)
     dp.include_router(subscription.router)
