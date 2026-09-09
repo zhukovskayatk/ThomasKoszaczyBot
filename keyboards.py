@@ -30,6 +30,8 @@ ADD_BUTTON_TEXT = "➕ Добавить"
 QUICK_CLOSE_BUTTON_TEXT = "✅ Я сделал!"
 CHECKLIST_BUTTON_TEXT = "☀️ Чек-лист"
 PROFILE_BUTTON_TEXT = "👤 Профиль и Настройки"
+PREMIUM_BUTTON_TEXT = "💎 Premium"
+PARTNER_BUTTON_TEXT = "👥 Партнёр"
 
 # --- "Устаревшие" подписи кнопок --------------------------------------------
 #
@@ -89,10 +91,53 @@ main_menu_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=TASKS_BUTTON_TEXT), KeyboardButton(text=ADD_BUTTON_TEXT)],
         [KeyboardButton(text=QUICK_CLOSE_BUTTON_TEXT), KeyboardButton(text=CHECKLIST_BUTTON_TEXT)],
-        [KeyboardButton(text=PROFILE_BUTTON_TEXT)],
+        [KeyboardButton(text=PROFILE_BUTTON_TEXT), KeyboardButton(text=PREMIUM_BUTTON_TEXT)],
+        [KeyboardButton(text=PARTNER_BUTTON_TEXT)],
     ],
     resize_keyboard=True,
 )
+
+
+def premium_buy_keyboard(is_active: bool) -> InlineKeyboardBuilder:
+    """
+    Кнопка на экране "💎 Premium". Текст меняется в зависимости от того,
+    активна ли подписка уже сейчас (см. handlers/subscription.py) — купить
+    первый раз или продлить действующую формулируются по-разному, хотя
+    технически это один и тот же callback ("premium_buy").
+    """
+    builder = InlineKeyboardBuilder()
+    label = "🔄 Продлить Premium" if is_active else "💎 Оформить Premium"
+    builder.button(text=label, callback_data="premium_buy")
+    return builder
+
+
+def partner_screen_keyboard(is_premium: bool, is_paired: bool) -> InlineKeyboardBuilder:
+    """
+    Кнопки на экране "👥 Партнёр" (см. handlers/partner.py):
+    - без Premium — единственная кнопка ведёт на экран оформления подписки
+      (партнёрский режим целиком заблокирован без неё);
+    - с Premium и без пары — предложение получить ссылку-приглашение;
+    - с Premium и уже в паре — только отвязка (сам процесс приглашения
+      партнёру не нужен, пока пара уже есть).
+    """
+    builder = InlineKeyboardBuilder()
+    if not is_premium:
+        builder.button(text="💎 Оформить Premium", callback_data="partner_go_premium")
+    elif is_paired:
+        builder.button(text="🔓 Отвязать партнёра", callback_data="partner_unlink")
+    else:
+        builder.button(text="🔗 Получить ссылку-приглашение", callback_data="partner_invite")
+    builder.adjust(1)
+    return builder
+
+
+def partner_unlink_confirm_keyboard() -> InlineKeyboardBuilder:
+    """Подтверждение перед разрывом пары (кнопка "🔓 Отвязать партнёра")."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔓 Да, отвязать", callback_data="partner_unlink_yes")
+    builder.button(text="◀️ Отмена", callback_data="partner_unlink_no")
+    builder.adjust(2)
+    return builder
 
 
 # Подпись кнопки "Без приоритета" на ЭКРАНЕ ВЫБОРА (см. priority_keyboard) —
@@ -127,7 +172,9 @@ def priority_keyboard(task_id: int) -> InlineKeyboardBuilder:
     return builder
 
 
-def quick_close_session_keyboard(remaining_tasks: list, has_progress: bool) -> InlineKeyboardBuilder:
+def quick_close_session_keyboard(
+    remaining_tasks: list, has_progress: bool, viewer_user_id: int | None = None
+) -> InlineKeyboardBuilder:
     """
     Клавиатура накопительного чек-ина "✅ Я сделал!" (см.
     handlers/tasks.py::qc_open/qc_close/qc_finish) — одна кнопка на каждую
@@ -138,12 +185,18 @@ def quick_close_session_keyboard(remaining_tasks: list, has_progress: bool) -> I
       пока не жалко, отчитываться не о чем);
     - как только закрыта хотя бы одна задача — "🏁 Всё на сегодня!"
       (это уже осознанное завершение сессии с зафиксированным отчётом).
+
+    viewer_user_id — id того, кто сейчас смотрит на меню; remaining_tasks
+    (см. database.requests.get_active_tasks) может включать и ОБЩИЕ задачи
+    партнёра (партнёрский режим, Premium) — такие помечаются значком 👥
+    перед названием, чтобы не путать со своими.
     """
     builder = InlineKeyboardBuilder()
     for task in remaining_tasks:
         xp_amount = XP_BY_PRIORITY.get(task.priority, XP_PER_TASK)
         short_title = task.title if len(task.title) <= 28 else task.title[:27] + "…"
-        builder.button(text=f"▫️ {short_title} (+{xp_amount} XP)", callback_data=f"qc_close:{task.task_id}")
+        marker = "👥 " if (viewer_user_id is not None and task.user_id != viewer_user_id) else ""
+        builder.button(text=f"▫️ {marker}{short_title} (+{xp_amount} XP)", callback_data=f"qc_close:{task.task_id}")
 
     if has_progress:
         builder.button(text="🏁 Всё на сегодня!", callback_data="qc_finish")
@@ -154,7 +207,7 @@ def quick_close_session_keyboard(remaining_tasks: list, has_progress: bool) -> I
     return builder
 
 
-def _task_button_label(task) -> str:
+def _task_button_label(task, viewer_user_id: int | None = None) -> str:
     """
     Текст кнопки одной задачи в списке "📋 Мои задачи": иконка СРОЧНОСТИ
     (🔥 просрочено/горит сегодня, ⏳ ближайшие дни, 🌱 без дедлайна — см.
@@ -162,25 +215,34 @@ def _task_button_label(task) -> str:
     только кружками 🔴🟡🟢 в карточке и в тексте самого списка) + название
     + короткий суффикс дедлайна, например "🔥 Чесать котов · 18:15". Для
     задач без дедлайна суффикса нет вообще (см. texts.button_deadline_suffix).
+
+    Если задача принадлежит не viewer_user_id, а его партнёру (общая
+    задача, партнёрский режим, Premium — см. database.requests.get_active_tasks),
+    перед названием добавляется значок 👥, чтобы не путать "моё" и "общее".
     """
     marker = URGENCY_MARKERS.get(task_urgency_category(task), "")
+    partner_marker = "👥 " if (viewer_user_id is not None and task.user_id != viewer_user_id) else ""
     short_title = (
         task.title if len(task.title) <= _TASK_BUTTON_TITLE_LIMIT
         else task.title[:_TASK_BUTTON_TITLE_LIMIT - 1] + "…"
     )
     suffix = button_deadline_suffix(task)
     if suffix:
-        return f"{marker} {short_title} · {suffix}"
-    return f"{marker} {short_title}"
+        return f"{marker} {partner_marker}{short_title} · {suffix}"
+    return f"{marker} {partner_marker}{short_title}"
 
 
-def tasks_page_keyboard(tasks_sorted: list, offset: int) -> tuple[InlineKeyboardBuilder, int]:
+def tasks_page_keyboard(
+    tasks_sorted: list, offset: int, viewer_user_id: int | None = None
+) -> tuple[InlineKeyboardBuilder, int]:
     """
     Строит одну "страницу" списка "📋 Мои задачи": каждая задача — кликабельная
     кнопка, открывающая её карточку (см. task_card_keyboard). tasks_sorted —
     уже отсортированный по срочности список (get_active_tasks_by_deadline:
     сначала просроченные/горящие сегодня, потом ближайшие дни по возрастанию
     даты, потом без дедлайна — та же сортировка, что и маркеры на кнопках).
+
+    viewer_user_id — см. _task_button_label (маркер 👥 у общих задач партнёра).
     """
     offset = max(0, offset)
     if tasks_sorted and offset >= len(tasks_sorted):
@@ -191,7 +253,9 @@ def tasks_page_keyboard(tasks_sorted: list, offset: int) -> tuple[InlineKeyboard
 
     builder = InlineKeyboardBuilder()
     for task in page:
-        builder.button(text=_task_button_label(task), callback_data=f"card_open:{task.task_id}:{offset}")
+        builder.button(
+            text=_task_button_label(task, viewer_user_id), callback_data=f"card_open:{task.task_id}:{offset}"
+        )
 
     row_sizes = [1] * len(page)
 
@@ -510,7 +574,13 @@ def snooze_menu_keyboard(reminder_id: int, task_id: int) -> InlineKeyboardBuilde
     return builder
 
 
-def task_card_keyboard(task_id: int, offset: int, in_checklist_today: bool) -> InlineKeyboardBuilder:
+def task_card_keyboard(
+    task_id: int,
+    offset: int,
+    in_checklist_today: bool,
+    is_shared: bool = False,
+    can_toggle_shared: bool = False,
+) -> InlineKeyboardBuilder:
     """
     Кнопки управления карточкой задачи (открывается кликом по задаче в
     списке "📋 Мои задачи"). offset — с какой страницы списка сюда попали,
@@ -522,6 +592,14 @@ def task_card_keyboard(task_id: int, offset: int, in_checklist_today: bool) -> I
     (её дедлайн — сегодня), кнопка предлагает убрать её оттуда (снимает
     дедлайн, задача уходит в бэклог); False — задачи там ещё нет, кнопка
     предлагает быстро добавить (дедлайн станет "сегодня, в течение дня").
+
+    can_toggle_shared — партнёрский режим (Premium): показывать ли кнопку
+    "личная/общая" вообще — её видит только ВЛАДЕЛЕЦ задачи, и только с
+    активным Premium (см. handlers/tasks.py::_task_card_extras); партнёр,
+    открывший общую задачу, эту кнопку не видит — решать, каким задачам
+    "быть общими", может только сам владелец (см.
+    database.requests.toggle_task_shared). is_shared — текущее состояние
+    этого конкретного переключателя (Task.shared), решает подпись кнопки.
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить текст", callback_data=f"card_edittext:{task_id}")
@@ -531,9 +609,17 @@ def task_card_keyboard(task_id: int, offset: int, in_checklist_today: bool) -> I
         builder.button(text="🌙 Убрать из Чек-листа дня", callback_data=f"card_chk_out:{task_id}")
     else:
         builder.button(text="☀️ Включить в Чек-лист дня", callback_data=f"card_chk_in:{task_id}")
+
+    row_sizes = [1, 1, 1, 1]
+    if can_toggle_shared:
+        toggle_label = "🔒 Сделать личной" if is_shared else "👥 Сделать общей с партнёром"
+        builder.button(text=toggle_label, callback_data=f"card_toggle_shared:{task_id}")
+        row_sizes.append(1)
+
     builder.button(text="🗑 Удалить", callback_data=f"card_delete:{task_id}")
     builder.button(text="◀️ Назад к списку", callback_data=f"tasks_page:{offset}")
-    builder.adjust(1, 1, 1, 1, 1, 1)
+    row_sizes += [1, 1]
+    builder.adjust(*row_sizes)
     return builder
 
 

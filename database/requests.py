@@ -7,10 +7,11 @@
 переедем на PostgreSQL), хендлеры менять не придётся.
 """
 
+import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from database.models import Habit, Priority, Reminder, ReminderOffset, Status, Task, User, async_session
 
@@ -48,13 +49,46 @@ async def get_active_tasks(user_id: int) -> list[Task]:
     Возвращает список невыполненных задач пользователя, в порядке
     создания (используется, например, для меню "🎉 Я сделал!", где важен
     порядок "новые сверху", а не порядок дедлайнов).
+
+    Партнёрский режим (Premium): если у пользователя есть привязанный
+    партнёр (User.family_id, см. get_partner), в список ДОБАВЛЯЮТСЯ ещё и
+    задачи партнёра, которые тот явно пометил "общими" (Task.shared=True,
+    см. toggle_task_shared) — просто как единый список того же вида,
+    никакого отдельного UI не нужно. Это единственное место, где нужно
+    было "влить" партнёрские задачи — get_active_tasks_by_deadline ниже
+    просто сортирует уже полученный отсюда список, а меню "🎉 Я сделал!"
+    использует эту же функцию напрямую, так что оба места получают общие
+    задачи автоматически, без дублирования логики.
     """
     async with async_session() as session:
-        result = await session.execute(
-            select(Task)
-            .where(Task.user_id == user_id, Task.status == Status.in_progress)
-            .order_by(Task.task_id)
-        )
+        user = await session.get(User, user_id)
+
+        if user is not None and user.family_id is not None:
+            partner_ids_result = await session.execute(
+                select(User.user_id).where(User.family_id == user.family_id, User.user_id != user_id)
+            )
+            partner_ids = [row[0] for row in partner_ids_result.all()]
+        else:
+            partner_ids = []
+
+        if partner_ids:
+            result = await session.execute(
+                select(Task)
+                .where(
+                    Task.status == Status.in_progress,
+                    or_(
+                        Task.user_id == user_id,
+                        (Task.user_id.in_(partner_ids)) & (Task.shared.is_(True)),
+                    ),
+                )
+                .order_by(Task.task_id)
+            )
+        else:
+            result = await session.execute(
+                select(Task)
+                .where(Task.user_id == user_id, Task.status == Status.in_progress)
+                .order_by(Task.task_id)
+            )
         return list(result.scalars().all())
 
 
@@ -85,61 +119,93 @@ async def get_active_tasks_by_deadline(user_id: int) -> list[Task]:
     return sorted(tasks, key=_deadline_sort_key)
 
 
+async def _authorized_task(session, task_id: int, user_id: int) -> Task | None:
+    """
+    Общая проверка доступа к задаче — используется ВМЕСТО прямого
+    "Task.user_id == user_id" везде, где раньше был единоличный доступ
+    только у владельца (get_task, mark_task_done, set_task_priority,
+    update_task_title, delete_task, set_task_deadline).
+
+    Доступ разрешён, если:
+    1. user_id — настоящий владелец задачи (как и было всегда), ЛИБО
+    2. задача явно помечена "общей" (Task.shared=True, см.
+       toggle_task_shared) И user_id — партнёр владельца (то есть у обоих
+       один и тот же User.family_id, см. get_partner/accept_partner_invite).
+
+    Партнёр получает ПОЛНЫЕ права редактирования на общую задачу (менять
+    текст, приоритет, срок, отмечать выполненной, удалять) — ровно как
+    сам владелец, никаких урезанных прав "только просмотр". Владелец при
+    этом остаётся единственным, кто решает, сделать ли задачу общей
+    вообще (см. toggle_task_shared) — эта проверка того НЕ затрагивает.
+    """
+    task = await session.get(Task, task_id)
+    if task is None:
+        return None
+    if task.user_id == user_id:
+        return task
+    if not task.shared:
+        return None
+
+    owner = await session.get(User, task.user_id)
+    acting_user = await session.get(User, user_id)
+    if owner is None or acting_user is None:
+        return None
+    if owner.family_id is None or acting_user.family_id is None:
+        return None
+    if owner.family_id != acting_user.family_id:
+        return None
+    return task
+
+
 async def mark_task_done(task_id: int, user_id: int) -> bool:
     """
     Отмечает задачу как выполненную.
 
-    Дополнительно проверяем:
-    - user_id — чтобы один пользователь не мог случайно (или намеренно)
-      закрыть чужую задачу по её id;
-    - status == in_progress — чтобы ПОВТОРНОЕ нажатие на кнопку
-      "Выполнено" (например, если она случайно нажалась дважды подряд,
-      пока Telegram ещё не успел перерисовать сообщение) не засчитывалось
-      второй раз и не начисляло XP повторно за одну и ту же задачу.
+    Проверка доступа — через _authorized_task (владелец или партнёр по
+    общей задаче, см. её докстринг). Отдельно проверяем status ==
+    in_progress — чтобы ПОВТОРНОЕ нажатие на кнопку "Выполнено" (например,
+    если она случайно нажалась дважды подряд, пока Telegram ещё не успел
+    перерисовать сообщение) не засчитывалось второй раз и не начисляло XP
+    повторно за одну и ту же задачу.
 
-    Возвращает True, только если задача была найдена, принадлежит этому
+    Возвращает True, только если задача была найдена, доступна этому
     пользователю И ещё не была выполнена раньше.
     """
     async with async_session() as session:
-        result = await session.execute(
-            update(Task)
-            .where(
-                Task.task_id == task_id,
-                Task.user_id == user_id,
-                Task.status == Status.in_progress,
-            )
-            .values(status=Status.done, completed_at=datetime.now())
-        )
+        task = await _authorized_task(session, task_id, user_id)
+        if task is None or task.status != Status.in_progress:
+            return False
+        task.status = Status.done
+        task.completed_at = datetime.now()
         await session.commit()
-        return result.rowcount > 0
+        return True
 
 
 async def set_task_priority(task_id: int, user_id: int, priority: Priority) -> bool:
     """
     Устанавливает приоритет задачи (используется после нажатия на кнопку
-    🟢/🟡/🔴 под сообщением о добавленной задаче).
-    Проверяем user_id — чтобы нельзя было поменять приоритет чужой задачи.
+    🟢/🟡/🔴 под сообщением о добавленной задаче). Доступ — через
+    _authorized_task (владелец или партнёр по общей задаче).
     """
     async with async_session() as session:
-        result = await session.execute(
-            update(Task)
-            .where(Task.task_id == task_id, Task.user_id == user_id)
-            .values(priority=priority)
-        )
+        task = await _authorized_task(session, task_id, user_id)
+        if task is None:
+            return False
+        task.priority = priority
         await session.commit()
-        return result.rowcount > 0
+        return True
 
 
 async def update_task_title(task_id: int, user_id: int, title: str) -> bool:
-    """Меняет текст задачи (карточка задачи → "✏️ Изменить текст")."""
+    """Меняет текст задачи (карточка задачи → "✏️ Изменить текст"). Доступ —
+    через _authorized_task (владелец или партнёр по общей задаче)."""
     async with async_session() as session:
-        result = await session.execute(
-            update(Task)
-            .where(Task.task_id == task_id, Task.user_id == user_id)
-            .values(title=title)
-        )
+        task = await _authorized_task(session, task_id, user_id)
+        if task is None:
+            return False
+        task.title = title
         await session.commit()
-        return result.rowcount > 0
+        return True
 
 
 async def delete_task(task_id: int, user_id: int) -> bool:
@@ -148,11 +214,13 @@ async def delete_task(task_id: int, user_id: int) -> bool:
     Task.reminders объявлена с cascade="all, delete-orphan" — SQLAlchemy
     сам удалит связанные строки reminders). Постановку/снятие таймеров в
     APScheduler делает вызывающий код (services/scheduler.py) — здесь
-    только работа с базой.
+    только работа с базой. Доступ — через _authorized_task (владелец или
+    партнёр по общей задаче — партнёр тоже может удалить общую задачу, у
+    него полные права на неё).
     """
     async with async_session() as session:
-        task = await session.get(Task, task_id)
-        if task is None or task.user_id != user_id:
+        task = await _authorized_task(session, task_id, user_id)
+        if task is None:
             return False
         await session.delete(task)
         await session.commit()
@@ -161,15 +229,13 @@ async def delete_task(task_id: int, user_id: int) -> bool:
 
 async def get_task(task_id: int, user_id: int) -> Task | None:
     """
-    Возвращает задачу по id, если она принадлежит указанному пользователю
-    (иначе None). Используется, чтобы показать свежий текст задачи после
+    Возвращает задачу по id, если она доступна указанному пользователю —
+    владельцу, либо партнёру по общей задаче (см. _authorized_task),
+    иначе None. Используется, чтобы показать свежий текст задачи после
     изменения приоритета/дедлайна.
     """
     async with async_session() as session:
-        task = await session.get(Task, task_id)
-        if task is None or task.user_id != user_id:
-            return None
-        return task
+        return await _authorized_task(session, task_id, user_id)
 
 
 async def add_xp(user_id: int, amount: int) -> int:
@@ -195,6 +261,163 @@ async def get_user(user_id: int) -> User | None:
     """Возвращает пользователя по id (или None, если его нет в БД)."""
     async with async_session() as session:
         return await session.get(User, user_id)
+
+
+# --- Подписка Premium (оплата звёздами Telegram, см. handlers/subscription.py) ---
+
+def is_premium_active(user: User) -> bool:
+    """
+    Действует ли Premium прямо сейчас. Намеренно чистая функция без
+    похода в БД — принимает уже загруженного User (см. User.premium_until),
+    чтобы код, который и так уже получил пользователя, не делал лишний
+    запрос только ради этой проверки.
+    """
+    return user.premium_until is not None and user.premium_until > datetime.now()
+
+
+async def extend_premium(user_id: int, days: int = 30) -> datetime:
+    """
+    Продлевает Premium на `days` дней и возвращает новую дату окончания.
+
+    Если подписка ещё активна — прибавляет дни К ТЕКУЩЕЙ дате окончания
+    (несколько платежей подряд честно складываются, а не "теряют" уже
+    оплаченный остаток). Если подписки нет или она уже истекла — отсчёт
+    идёт от текущего момента.
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            user = User(user_id=user_id)
+            session.add(user)
+
+        base = user.premium_until if (user.premium_until and user.premium_until > datetime.now()) else datetime.now()
+        user.premium_until = base + timedelta(days=days)
+        await session.commit()
+        return user.premium_until
+
+
+# --- Партнёрский режим (экран "👥 Партнёр", Premium-фича) -----------------------
+#
+# Пара хранится максимально просто, без отдельной таблицы: у обоих
+# участников пары User.family_id проставляется в ОДНО И ТО ЖЕ значение
+# (id того, кто первым создал приглашение) — этого достаточно, чтобы
+# симметрично находить партнёра друг друга (см. get_partner) и проверять
+# доступ к общим задачам (см. _authorized_task выше). Само приглашение —
+# это одноразовый код в User.partner_invite_code, из которого строится
+# диплинк t.me/<bot>?start=pair_<code> (см. handlers/partner.py,
+# handlers/start.py).
+
+
+@dataclass
+class PairResult:
+    """Результат попытки принять приглашение в пару (см. accept_partner_invite)."""
+    ok: bool
+    reason: str = ""  # "invalid_code" / "self_invite" / "already_paired" / "inviter_already_paired"
+    partner: User | None = None  # тот, с кем только что образовалась пара (при ok=True)
+
+
+async def get_partner(user_id: int) -> User | None:
+    """
+    Возвращает текущего партнёра пользователя, если пара уже образована
+    (см. User.family_id), иначе None. Симметрично работает для ОБЕИХ
+    сторон пары — не важно, кто именно когда-то был инициатором.
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None or user.family_id is None:
+            return None
+        result = await session.execute(
+            select(User).where(User.family_id == user.family_id, User.user_id != user_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def create_partner_invite(user_id: int) -> str:
+    """
+    Выпускает новый код приглашения для диплинка (кнопка "🔗 Получить
+    ссылку-приглашение" на экране "👥 Партнёр") — вызывающий код
+    (handlers/partner.py) сам проверяет Premium и отсутствие уже
+    привязанного партнёра ДО вызова этой функции. Каждый вызов
+    перезаписывает предыдущий код — старая ссылка (если её кто-то не успел
+    открыть) автоматически становится недействительной.
+    """
+    code = secrets.token_urlsafe(6)
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            user = User(user_id=user_id)
+            session.add(user)
+        user.partner_invite_code = code
+        await session.commit()
+        return code
+
+
+async def accept_partner_invite(code: str, acceptor_user_id: int) -> PairResult:
+    """
+    Принимает приглашение по коду из диплинка (/start pair_<code>, см.
+    handlers/start.py). Проверки — по порядку:
+    1. код существует (кто-то с таким partner_invite_code найден);
+    2. это не сам инициатор (нельзя пригласить самого себя той же ссылкой);
+    3. у принимающего ещё нет своего партнёра;
+    4. у пригласившего тоже ещё нет партнёра (на случай, если он успел
+       где-то ещё создать пару, пока ссылка гуляла).
+
+    При успехе — оба получают одинаковый family_id (id пригласившего), а
+    код приглашения сбрасывается, чтобы им нельзя было воспользоваться
+    повторно.
+    """
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.partner_invite_code == code))
+        inviter = result.scalar_one_or_none()
+        if inviter is None:
+            return PairResult(ok=False, reason="invalid_code")
+        if inviter.user_id == acceptor_user_id:
+            return PairResult(ok=False, reason="self_invite")
+
+        acceptor = await session.get(User, acceptor_user_id)
+        if acceptor is None:
+            acceptor = User(user_id=acceptor_user_id)
+            session.add(acceptor)
+            await session.flush()
+
+        if acceptor.family_id is not None:
+            return PairResult(ok=False, reason="already_paired")
+        if inviter.family_id is not None:
+            return PairResult(ok=False, reason="inviter_already_paired")
+
+        family_id = inviter.user_id
+        inviter.family_id = family_id
+        acceptor.family_id = family_id
+        inviter.partner_invite_code = None
+        await session.commit()
+        await session.refresh(inviter)
+        return PairResult(ok=True, partner=inviter)
+
+
+async def unlink_partner(user_id: int) -> User | None:
+    """
+    Разрывает пару (кнопка "🔓 Отвязать партнёра") — снимает family_id у
+    ОБОИХ участников сразу (иначе один считался бы всё ещё в паре, пока
+    сам не отвяжется тоже). Общие задачи (Task.shared) при этом НЕ
+    трогаем и не разделяем обратно — они просто перестают быть видны
+    партнёру, т.к. доступ по _authorized_task проверяет живую пару через
+    family_id, а не хранит его на самой задаче. Возвращает отвязанного
+    партнёра (для прощального уведомления ему), либо None, если пары и не
+    было.
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None or user.family_id is None:
+            return None
+        result = await session.execute(
+            select(User).where(User.family_id == user.family_id, User.user_id != user_id)
+        )
+        partner = result.scalar_one_or_none()
+        user.family_id = None
+        if partner is not None:
+            partner.family_id = None
+        await session.commit()
+        return partner
 
 
 # --- Настройки уведомлений (экран "🔔 Уведомления" в профиле) -------------------
@@ -585,17 +808,36 @@ async def set_task_deadline(
     """
     Устанавливает (или снимает, если deadline=None) дедлайн задачи.
     all_day=True — дедлайн выбран кнопкой "☀️ В течение дня" (без точного
-    часа, см. Task.deadline_all_day). Проверяем user_id, чтобы нельзя было
-    проставить дедлайн чужой задаче.
+    часа, см. Task.deadline_all_day). Доступ — через _authorized_task
+    (владелец или партнёр по общей задаче).
     """
     async with async_session() as session:
-        result = await session.execute(
-            update(Task)
-            .where(Task.task_id == task_id, Task.user_id == user_id)
-            .values(deadline=deadline, deadline_all_day=all_day)
-        )
+        task = await _authorized_task(session, task_id, user_id)
+        if task is None:
+            return False
+        task.deadline = deadline
+        task.deadline_all_day = all_day
         await session.commit()
-        return result.rowcount > 0
+        return True
+
+
+async def toggle_task_shared(task_id: int, user_id: int) -> Task | None:
+    """
+    Переключает "личная/общая" (Task.shared) — В ОТЛИЧИЕ от остальных
+    операций выше, доступно ТОЛЬКО настоящему владельцу задачи, не через
+    _authorized_task: партнёр не может решать за другого, каким его
+    задачам "быть общими" — это выбор делает только тот, кому задача
+    принадлежит. Возвращает обновлённую задачу, либо None, если задача не
+    найдена или user_id не её владелец.
+    """
+    async with async_session() as session:
+        task = await session.get(Task, task_id)
+        if task is None or task.user_id != user_id:
+            return None
+        task.shared = not task.shared
+        await session.commit()
+        await session.refresh(task)
+        return task
 
 
 async def get_task_reminders(task_id: int) -> list[Reminder]:

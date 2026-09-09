@@ -21,7 +21,7 @@ from aiogram.types import BotCommand
 
 from config import settings
 from database.models import init_db
-from handlers import checklist, dev_tools, profile, start, tasks
+from handlers import checklist, dev_tools, partner, profile, start, subscription, tasks
 from services.scheduler import init_scheduler, resync_reminders
 
 
@@ -52,16 +52,21 @@ async def main() -> None:
 
     # Подключаем роутеры из handlers/. Порядок ВАЖЕН: в tasks.router есть
     # "ловец" любого обычного текста (превращает его в новую задачу) — если
-    # его подключить раньше profile.router/checklist.router, их кнопки
-    # ("🏆 Профиль", "☀️ Чек-лист") будут перехвачены этим ловцом и
-    # превратятся в задачу вместо открытия своего экрана. Поэтому
-    # tasks.router всегда подключаем последним. dev_tools.router ловит
-    # только стикеры и команду /addpack, с текстовыми хэндлерами
-    # tasks.router не пересекается, поэтому его место среди остальных
-    # не критично.
+    # его подключить раньше profile.router/checklist.router/subscription.router/
+    # partner.router, их кнопки ("🏆 Профиль", "☀️ Чек-лист", "💎 Premium",
+    # "👥 Партнёр") будут перехвачены этим ловцом и превратятся в задачу
+    # вместо открытия своего экрана. Поэтому tasks.router всегда подключаем
+    # последним. dev_tools.router ловит только стикеры и команду /addpack,
+    # с текстовыми хэндлерами tasks.router не пересекается, поэтому его
+    # место среди остальных не критично. subscription.router дополнительно
+    # ловит pre_checkout_query и сообщения с successful_payment — это
+    # отдельные типы апдейтов, их порядок относительно остальных роутеров
+    # не важен.
     dp.include_router(start.router)
     dp.include_router(profile.router)
     dp.include_router(checklist.router)
+    dp.include_router(subscription.router)
+    dp.include_router(partner.router)
     dp.include_router(dev_tools.router)
     dp.include_router(tasks.router)
 
@@ -72,6 +77,8 @@ async def main() -> None:
         BotCommand(command="add", description="Добавить задачу: /add текст задачи"),
         BotCommand(command="tasks", description="Показать список задач"),
         BotCommand(command="profile", description="Профиль: уровень и XP"),
+        BotCommand(command="premium", description="Premium-подписка"),
+        BotCommand(command="partner", description="Партнёрский режим — общие задачи для двоих"),
         BotCommand(command="addpack", description="Забрать весь набор стикеров одним разом"),
     ])
 

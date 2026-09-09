@@ -61,10 +61,13 @@ from database.requests import (
     get_streak_status,
     get_task,
     get_task_reminders,
+    get_user,
+    is_premium_active,
     recompute_reminders_for_new_deadline,
     remove_reminder,
     set_task_deadline,
     set_task_priority,
+    toggle_task_shared,
     update_task_title,
 )
 from keyboards import (
@@ -139,18 +142,43 @@ async def confirm_task_added(message: Message, task) -> None:
 async def show_tasks(message: Message) -> None:
     """
     Общая логика показа списка задач — вызывается и /tasks, и кнопкой.
-    Список отсортирован по срочности (get_active_tasks_by_deadline).
-    Каждая задача на текущей странице — кликабельная кнопка, открывающая
-    её карточку (см. tasks_page_keyboard / card_open).
+    Список отсортирован по срочности (get_active_tasks_by_deadline) и уже
+    включает ОБЩИЕ задачи партнёра, если он подключён (партнёрский режим,
+    Premium — см. database.requests.get_active_tasks). Каждая задача на
+    текущей странице — кликабельная кнопка, открывающая её карточку (см.
+    tasks_page_keyboard / card_open); viewer_user_id передаётся дальше,
+    чтобы пометить общие задачи значком 👥 и не путать их со своими.
     """
-    tasks = await get_active_tasks_by_deadline(user_id=message.from_user.id)
+    user_id = message.from_user.id
+    tasks = await get_active_tasks_by_deadline(user_id=user_id)
 
     if not tasks:
         await message.answer(texts.no_active_tasks_text(), reply_markup=main_menu_keyboard)
         return
 
-    keyboard, offset = tasks_page_keyboard(tasks, offset=0)
-    await message.answer(texts.tasks_list_text(tasks), reply_markup=keyboard.as_markup())
+    keyboard, offset = tasks_page_keyboard(tasks, offset=0, viewer_user_id=user_id)
+    await message.answer(texts.tasks_list_text(tasks, viewer_user_id=user_id), reply_markup=keyboard.as_markup())
+
+
+async def _task_card_extras(task, viewer_user_id: int) -> tuple[bool, bool]:
+    """
+    Доп. параметры отрисовки карточки задачи под партнёрский режим
+    (см. keyboards.task_card_keyboard / texts.task_card_text):
+    - shared_by_partner — True, если это ЧУЖАЯ общая задача, открытая
+      партнёром (не своя) — карточка тогда отмечается плашкой об этом.
+    - can_toggle_shared — виден ли переключатель "личная/общая" вообще:
+      только настоящему владельцу задачи, и только пока у него активен
+      Premium (партнёрский режим целиком завязан на подписку, см.
+      database.requests.is_premium_active) — независимо от того,
+      подключён ли партнёр прямо сейчас: можно заранее пометить задачи
+      общими, до самого приглашения.
+    """
+    is_owner = task.user_id == viewer_user_id
+    if not is_owner:
+        return True, False
+    viewer = await get_user(viewer_user_id)
+    can_toggle_shared = viewer is not None and is_premium_active(viewer)
+    return False, can_toggle_shared
 
 
 def _default_time_for_date(year: int, month: int, day: int) -> tuple[int, int]:
@@ -226,15 +254,16 @@ async def tasks_page(callback: CallbackQuery) -> None:
     """Листание страниц списка "📋 Мои задачи" и кнопка "◀️ Назад к списку" в
     карточке задачи (она использует этот же callback_data)."""
     offset = int(callback.data.split(":", maxsplit=1)[1])
-    tasks = await get_active_tasks_by_deadline(user_id=callback.from_user.id)
+    user_id = callback.from_user.id
+    tasks = await get_active_tasks_by_deadline(user_id=user_id)
 
     if not tasks:
         await callback.message.edit_text(texts.no_active_tasks_text())
         await callback.answer()
         return
 
-    keyboard, offset = tasks_page_keyboard(tasks, offset)
-    await callback.message.edit_text(texts.tasks_list_text(tasks), reply_markup=keyboard.as_markup())
+    keyboard, offset = tasks_page_keyboard(tasks, offset, viewer_user_id=user_id)
+    await callback.message.edit_text(texts.tasks_list_text(tasks, viewer_user_id=user_id), reply_markup=keyboard.as_markup())
     await callback.answer()
 
 
@@ -261,13 +290,14 @@ async def quick_close_button(message: Message) -> None:
     накапливается прямо перед глазами (см. qc_close/qc_finish и
     texts.quick_close_progress_text).
     """
-    tasks = list(reversed(await get_active_tasks(user_id=message.from_user.id)))
+    user_id = message.from_user.id
+    tasks = list(reversed(await get_active_tasks(user_id=user_id)))
 
     if not tasks:
         await message.answer(texts.quick_close_nothing_text(), reply_markup=main_menu_keyboard)
         return
 
-    keyboard = quick_close_session_keyboard(tasks, has_progress=False)
+    keyboard = quick_close_session_keyboard(tasks, has_progress=False, viewer_user_id=user_id)
     await message.answer(texts.quick_close_start_text(), reply_markup=keyboard.as_markup())
 
 
@@ -379,7 +409,7 @@ async def qc_close(callback: CallbackQuery) -> None:
         await _qc_finalize(callback, session, key)
         return
 
-    keyboard = quick_close_session_keyboard(remaining_tasks, has_progress=True)
+    keyboard = quick_close_session_keyboard(remaining_tasks, has_progress=True, viewer_user_id=callback.from_user.id)
     await callback.message.edit_text(
         texts.quick_close_progress_text(session.closed, texts.random_quick_close_phrase()),
         reply_markup=keyboard.as_markup(),
@@ -456,9 +486,13 @@ async def add_task_from_text(message: Message) -> None:
 
         task = await get_task(task_id=pending_task_id, user_id=user_id)
         reminders = await get_task_reminders(pending_task_id)
+        shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
         await message.answer(
-            "✅ Текст обновлён!\n\n" + texts.task_card_text(task, reminders),
-            reply_markup=task_card_keyboard(pending_task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+            "✅ Текст обновлён!\n\n" + texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+            reply_markup=task_card_keyboard(
+                pending_task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+                is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            ).as_markup(),
         )
         return
 
@@ -649,10 +683,14 @@ async def wiz_cancel(callback: CallbackQuery) -> None:
     # CTX_EDIT — возвращаемся на карточку задачи без изменений.
     await callback.answer("Отменено")
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
     await _finish_wizard(
         callback,
-        texts.task_card_text(task, reminders),
-        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -800,10 +838,14 @@ async def cal_none(callback: CallbackQuery) -> None:
         await _finish_wizard(callback, texts.deadline_saved_text(task.title, task.priority, None))
     else:  # CTX_EDIT — возвращаемся на карточку задачи
         reminders = await get_task_reminders(task_id)
+        shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
         await _finish_wizard(
             callback,
-            texts.task_card_text(task, reminders),
-            task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+            texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+            task_card_keyboard(
+                task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+                is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            ).as_markup(),
         )
 
 
@@ -859,10 +901,14 @@ async def _save_all_day_deadline(
         await scheduler_service.schedule_reminder(task_id, reminder.offset, reminder.reminder_id, reminder.remind_at)
 
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
     await _finish_wizard(
         callback,
-        texts.task_card_text(task, reminders),
-        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -975,10 +1021,14 @@ async def td_confirm(callback: CallbackQuery) -> None:
 
     await callback.answer("Дедлайн обновлён ✅")
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
     await _finish_wizard(
         callback,
-        texts.task_card_text(task, reminders),
-        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -1074,10 +1124,14 @@ async def rmd_done(callback: CallbackQuery) -> None:
         return
 
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
     await _finish_wizard(
         callback,
-        texts.task_card_text(task, reminders),
-        task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -1094,10 +1148,14 @@ async def card_open(callback: CallbackQuery) -> None:
         return
 
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
     await callback.answer()
     await callback.message.edit_text(
-        texts.task_card_text(task, reminders),
-        reply_markup=task_card_keyboard(task_id, offset, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        reply_markup=task_card_keyboard(
+            task_id, offset, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -1186,9 +1244,12 @@ async def card_chk_in(callback: CallbackQuery) -> None:
 
     await callback.answer("Добавлено в Чек-лист дня ☀️")
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
     await callback.message.edit_text(
-        texts.task_card_text(task, reminders),
-        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=True).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        reply_markup=task_card_keyboard(
+            task_id, offset=0, in_checklist_today=True, is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -1215,9 +1276,12 @@ async def card_chk_out(callback: CallbackQuery) -> None:
 
     await callback.answer("Убрано из Чек-листа дня 🌙")
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
     await callback.message.edit_text(
-        texts.task_card_text(task, reminders),
-        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=False).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        reply_markup=task_card_keyboard(
+            task_id, offset=0, in_checklist_today=False, is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -1262,9 +1326,41 @@ async def card_delno(callback: CallbackQuery) -> None:
 
     await callback.answer("Отменено")
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
     await callback.message.edit_text(
-        texts.task_card_text(task, reminders),
-        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        reply_markup=task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("card_toggle_shared:"))
+async def card_toggle_shared(callback: CallbackQuery) -> None:
+    """
+    "👥 Сделать общей с партнёром" / "🔒 Сделать личной" в карточке задачи —
+    партнёрский режим (Premium). Кнопка видна только владельцу задачи (см.
+    keyboards.task_card_keyboard/can_toggle_shared) — toggle_task_shared
+    сам ещё раз проверяет владельца на уровне БД, так что даже если кто-то
+    руками пришлёт этот callback_data для чужой задачи, ничего не изменится.
+    """
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    user_id = callback.from_user.id
+    task = await toggle_task_shared(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Теперь общая с партнёром 👥" if task.shared else "Теперь личная 🔒")
+    reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
+    await callback.message.edit_text(
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        reply_markup=task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )
 
 
@@ -1385,8 +1481,12 @@ async def remind_open_card(callback: CallbackQuery) -> None:
         return
 
     reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
     await callback.answer()
     await callback.message.edit_text(
-        texts.task_card_text(task, reminders),
-        reply_markup=task_card_keyboard(task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task)).as_markup(),
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        reply_markup=task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+        ).as_markup(),
     )

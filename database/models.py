@@ -177,6 +177,27 @@ class User(Base):
     checklist_morning_push_enabled: Mapped[bool] = mapped_column(default=True)
     checklist_evening_push_enabled: Mapped[bool] = mapped_column(default=True)
 
+    # --- Подписка Premium (оплата звёздами Telegram, см. handlers/subscription.py) ---
+    # premium_until — момент, до которого действует подписка. None или дата
+    # в прошлом = обычный бесплатный аккаунт. Намеренно ХРАНИМ ТОЛЬКО ЭТУ
+    # дату, а не отдельный булевый флаг "is_premium" — так нет риска, что
+    # флаг и дата разъедутся между собой; "активна ли подписка сейчас"
+    # всегда считается на лету (см. database.requests.is_premium_active).
+    # Один платёж = +30 дней к текущему значению (или к "сейчас", если
+    # подписка уже истекла) — см. database.requests.extend_premium.
+    premium_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # --- Партнёрский режим (Premium-фича, см. database/requests.py) ---------
+    # Код текущего активного приглашения в пару (кнопка "🔗 Получить ссылку-
+    # приглашение" на экране "👥 Партнёр") — по нему строится диплинк
+    # t.me/<bot>?start=pair_<code>. None — приглашение не выпущено (либо
+    # уже использовано, см. database.requests.accept_partner_invite, где
+    # оно сбрасывается в None сразу после успешной привязки, чтобы одну и
+    # ту же ссылку нельзя было использовать дважды). Новое приглашение
+    # просто перезаписывает старый код — старая ссылка автоматически
+    # перестаёт работать.
+    partner_invite_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Связь "один пользователь — много задач"
     tasks: Mapped[list["Task"]] = relationship(back_populates="user")
 
@@ -223,6 +244,16 @@ class Task(Base):
     # сегодня — Task.status=done сам по себе не говорит, когда именно это
     # произошло.
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+
+    # Партнёрский режим (Premium-фича): True — владелец сделал задачу
+    # "общей" (кнопка "👥 Сделать общей с партнёром" в карточке задачи), и
+    # она видна и доступна для редактирования партнёру (см.
+    # database.requests._authorized_task/get_active_tasks). По умолчанию
+    # False — все задачи личные, ничего не меняется для тех, у кого партнёр
+    # вообще не подключён. Переключать может ТОЛЬКО сам владелец задачи
+    # (см. database.requests.toggle_task_shared) — партнёр не может решать
+    # за другого, каким его задачам "быть общими".
+    shared: Mapped[bool] = mapped_column(default=False)
 
     user: Mapped["User"] = relationship(back_populates="tasks")
 
@@ -355,6 +386,10 @@ async def _migrate_missing_columns(conn) -> None:
         await conn.exec_driver_sql(
             "ALTER TABLE users ADD COLUMN checklist_evening_push_enabled BOOLEAN NOT NULL DEFAULT 1"
         )
+    if "premium_until" not in existing_user_columns:
+        await conn.exec_driver_sql("ALTER TABLE users ADD COLUMN premium_until DATETIME")
+    if "partner_invite_code" not in existing_user_columns:
+        await conn.exec_driver_sql("ALTER TABLE users ADD COLUMN partner_invite_code TEXT")
 
     result = await conn.exec_driver_sql("PRAGMA table_info(tasks)")
     existing_task_columns = {row[1] for row in result.fetchall()}
@@ -367,6 +402,8 @@ async def _migrate_missing_columns(conn) -> None:
         )
     if "completed_at" not in existing_task_columns:
         await conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN completed_at DATETIME")
+    if "shared" not in existing_task_columns:
+        await conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN shared BOOLEAN NOT NULL DEFAULT 0")
 
     # reminders — таблица появилась позже tasks/users; если она уже
     # существует (бот какое-то время работал ДО этого шага), а колонки

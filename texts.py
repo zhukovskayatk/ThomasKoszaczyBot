@@ -113,6 +113,140 @@ def format_deadline(deadline, all_day: bool = False) -> str:
     return f"{deadline.day} {_MONTHS_GENITIVE_RU[deadline.month]} в {deadline.strftime('%H:%M')}"
 
 
+def _date_ru(moment) -> str:
+    """Дата без времени в родительном падеже, например «28 сентября 2026»."""
+    return f"{moment.day} {_MONTHS_GENITIVE_RU[moment.month]} {moment.year}"
+
+
+def premium_status_text(is_active: bool, premium_until, price_stars: int, duration_days: int) -> str:
+    """Экран "💎 Premium" — статус подписки + приглашение оформить/продлить."""
+    if is_active:
+        return (
+            "💎 <b>Premium активен</b>\n"
+            f"Действует до {_date_ru(premium_until)}.\n\n"
+            "Открыт партнёрский режим — общие задачи для двоих 👥\n\n"
+            f"Продлить ещё на {duration_days} дней можно в любой момент — "
+            f"дни добавятся к уже оплаченному сроку, а не сгорят."
+        )
+    return (
+        "💎 <b>Thomas Koszaczy Premium</b>\n\n"
+        "Что открывает Premium:\n"
+        "👥 Партнёрский режим — общее пространство задач для двоих\n"
+        "✨ Все будущие Premium-фичи автоматически\n\n"
+        f"Стоимость: {price_stars} ⭐ Stars / {duration_days} дней.\n"
+        "Оплата — прямо здесь, в Telegram, звёздами. Карты и банковские "
+        "данные боту не нужны и не видны."
+    )
+
+
+def premium_purchased_text(premium_until) -> str:
+    """Подтверждение после успешной оплаты (message.successful_payment)."""
+    return (
+        "✨ <b>Спасибо! Premium активирован.</b>\n"
+        f"Действует до {_date_ru(premium_until)}.\n\n"
+        "Партнёрский режим теперь доступен — загляни в 👥 Партнёр, там "
+        "появится кнопка приглашения."
+    )
+
+
+# --- Партнёрский режим (экран "👥 Партнёр", Premium-фича) -----------------------
+
+def _partner_display(partner) -> str:
+    """Короткое упоминание партнёра в тексте — по username, если он есть у
+    человека в Telegram, иначе просто нейтрально "партнёром"."""
+    if partner is not None and partner.username:
+        return f"@{partner.username}"
+    return "партнёром"
+
+
+def partner_screen_text(is_premium: bool, partner) -> str:
+    """
+    Экран "👥 Партнёр". partner — объект User партнёра, если пара уже
+    образована (см. database.requests.get_partner), иначе None.
+    """
+    if not is_premium:
+        return (
+            "👥 <b>Партнёрский режим</b>\n\n"
+            "Общее пространство задач для двоих — что один пометит "
+            "«общей задачей», увидит и сможет закрыть другой.\n\n"
+            "Доступно с 💎 Premium."
+        )
+    if partner is not None:
+        return (
+            "👥 <b>Партнёрский режим активен</b>\n"
+            f"Вы в паре с {_partner_display(partner)}.\n\n"
+            "В карточке любой своей задачи можно нажать «Сделать общей с "
+            "партнёром» — партнёр увидит её у себя в списке и сможет "
+            "закрыть или отредактировать."
+        )
+    return (
+        "👥 <b>Партнёрский режим</b>\n\n"
+        "Пары пока нет. Получи ссылку-приглашение и отправь её человеку, "
+        "с которым хочешь делиться задачами — как только он перейдёт по "
+        "ней в Telegram, вы окажетесь в паре.\n\n"
+        "После этого в карточке любой своей задачи появится кнопка "
+        "«Сделать общей с партнёром»."
+    )
+
+
+def partner_invite_link_text(link: str) -> str:
+    """Показывается после нажатия "🔗 Получить ссылку-приглашение"."""
+    return (
+        "🔗 <b>Ссылка готова!</b>\n"
+        f"{link}\n\n"
+        "Отправь её партнёру — как только он перейдёт по ней, вы окажетесь "
+        "в паре. Ссылка одноразовая: если получить новую, старая перестанет "
+        "работать."
+    )
+
+
+_PARTNER_INVITE_ERROR_TEXTS = {
+    "invalid_code": "🤔 Это приглашение уже не действует — попроси прислать новую ссылку.",
+    "self_invite": "😄 По собственной ссылке-приглашению в пару не встать — отправь её партнёру.",
+    "already_paired": "У тебя уже есть партнёр — сначала отвяжи его в 👥 Партнёр, если хочешь пригласить другого.",
+    "inviter_already_paired": "🤔 У этого приглашения уже появился партнёр — попроси прислать новую ссылку.",
+}
+
+
+def partner_invite_error_text(reason: str) -> str:
+    """Текст ошибки при переходе по невалидной/устаревшей ссылке-приглашению
+    (см. database.requests.PairResult.reason)."""
+    return _PARTNER_INVITE_ERROR_TEXTS.get(reason, "🤔 Не получилось создать пару — попробуй ещё раз.")
+
+
+def partner_paired_text(other) -> str:
+    """
+    Подтверждение образования пары — показывается ОБЕИМ сторонам (принявшему
+    приглашение — сразу, пригласившему — отдельным сообщением, см.
+    handlers/start.py). other — объект User второй стороны пары.
+    """
+    return (
+        f"✨ <b>Готово! Вы в паре с {_partner_display(other)}</b> 👥\n\n"
+        "Теперь в карточке любой своей задачи можно сделать её «общей» — "
+        "партнёр увидит её у себя и сможет помочь закрыть."
+    )
+
+
+def partner_unlink_confirm_text(partner) -> str:
+    """Подтверждение перед разрывом пары (кнопка "🔓 Отвязать партнёра")."""
+    return (
+        f"🔓 Точно отвязать {_partner_display(partner)}? Общие задачи "
+        "перестанут быть видны друг другу, но никуда не денутся — каждая "
+        "останется у своего владельца."
+    )
+
+
+def partner_unlinked_text() -> str:
+    """Подтверждение после успешного разрыва пары."""
+    return "🔓 Пара разорвана. Вернуться к партнёрскому режиму можно в любой момент — из 👥 Партнёр."
+
+
+def partner_unlinked_by_other_text(other) -> str:
+    """Уведомление ВТОРОЙ стороне, когда пару разорвал не он сам (см.
+    handlers/partner.py::partner_unlink_yes)."""
+    return f"🔓 {_partner_display(other)} отвязал(а) партнёрский доступ — общие задачи больше не видны друг другу."
+
+
 def welcome_text() -> str:
     """
     Компактное приветствие /start от маскота — котика Thomas Koszaczy.
@@ -235,13 +369,21 @@ def _list_bullet_detail(task) -> str:
     return f" <i>({short_date} {task.deadline.strftime('%H:%M')})</i>"
 
 
-def _list_bullet_line(task) -> str:
-    """Одна строка-буллет в дашборде списка задач: название + скобочная
-    деталь срока (если есть) + кружок приоритета в конце."""
-    return f"• <b>{escape(task.title)}</b>{_list_bullet_detail(task)} {PRIORITY_MARKERS[task.priority]}"
+def _list_bullet_line(task, viewer_user_id: int | None = None) -> str:
+    """
+    Одна строка-буллет в дашборде списка задач: название + скобочная
+    деталь срока (если есть) + кружок приоритета в конце.
+
+    viewer_user_id — если задача не принадлежит ему (общая задача
+    партнёра, партнёрский режим, Premium — см.
+    database.requests.get_active_tasks), перед названием добавляется
+    значок 👥 (та же логика, что и у keyboards._task_button_label).
+    """
+    partner_marker = "👥 " if (viewer_user_id is not None and task.user_id != viewer_user_id) else ""
+    return f"• {partner_marker}<b>{escape(task.title)}</b>{_list_bullet_detail(task)} {PRIORITY_MARKERS[task.priority]}"
 
 
-def tasks_list_text(tasks: list) -> str:
+def tasks_list_text(tasks: list, viewer_user_id: int | None = None) -> str:
     """
     Список задач как компактный дашборд с группировкой по срочности (см.
     task_urgency_category): 🔥 горят сегодня → ⏳ ближайшие → 🌱 бэклог,
@@ -249,6 +391,8 @@ def tasks_list_text(tasks: list) -> str:
     активных задач (не только текущая страница) — в отличие от инлайн-
     кнопок под сообщением (см. keyboards.tasks_page_keyboard), которые
     показывают только одну страницу, текст всегда даёт целостную картину.
+
+    viewer_user_id — см. _list_bullet_line (маркер 👥 у общих задач партнёра).
     """
     if not tasks:
         return no_active_tasks_text()
@@ -263,7 +407,7 @@ def tasks_list_text(tasks: list) -> str:
         if not group_tasks:
             continue
         blocks.append(f"{URGENCY_MARKERS[category]} <b>{_GROUP_TITLES[category]}:</b>")
-        blocks.extend(_list_bullet_line(task) for task in group_tasks)
+        blocks.extend(_list_bullet_line(task, viewer_user_id) for task in group_tasks)
         blocks.append("")
 
     if blocks[-1] == "":
@@ -800,18 +944,25 @@ def card_deadline_text(task) -> str:
     return f"{day_part} в {deadline.strftime('%H:%M')}"
 
 
-def task_card_text(task, reminders) -> str:
+def task_card_text(task, reminders, shared_by_partner: bool = False) -> str:
     """
     Детальная карточка задачи (открывается кликом по задаче в списке
     "📋 Мои задачи") — оформлена как "посадочный талон": рамки-разделители
     сверху и снизу, плашки-поля с фиксированными иконками. reminders —
     список ещё не сработавших Reminder этой задачи (см.
     database.requests.get_task_reminders).
+
+    shared_by_partner=True — это ОБЩАЯ задача партнёра, открытая через
+    партнёрский режим (Premium, см. database.requests._authorized_task), а
+    не своя — добавляем короткую плашку об этом, чтобы не путать её со
+    своими задачами (полные права редактирования при этом остаются те же).
     """
     urgency_marker = URGENCY_MARKERS[task_urgency_category(task)]
 
-    lines = [
-        f"📌 <b>{escape(task.title)}</b>",
+    lines = [f"📌 <b>{escape(task.title)}</b>"]
+    if shared_by_partner:
+        lines.append("👥 <i>Общая задача партнёра</i>")
+    lines += [
         _DIVIDER,
         f"⚡️ <b>Приоритет:</b> {PRIORITY_LABELS[task.priority]}",
     ]
