@@ -849,7 +849,7 @@ async def _create_task_with_ai(
         if parsed.deadline is not None:
             timeutils.localize_task(task, tz_offset)
             intro = (
-                "🤖 Заметила дату в сообщении.\n"
+                f"🤖 {texts.random_ai_recognized_phrase()}\n"
                 + texts.task_added_text(task.title, task.priority)
                 + f"\n⏳ <i>Срок: {texts.format_deadline(task.deadline, task.deadline_all_day)}</i>"
             )
@@ -859,7 +859,7 @@ async def _create_task_with_ai(
         return
 
     # Приоритет уже определён ИИ — отдельно спрашивать не нужно.
-    intro = "🤖 Распознала из сообщения:\n" + texts.task_added_text(task.title, task.priority)
+    intro = f"🤖 {texts.random_ai_recognized_phrase()}\n" + texts.task_added_text(task.title, task.priority)
 
     if task.deadline is not None:
         # available_reminder_offsets ДО localize_task — ей нужен ещё

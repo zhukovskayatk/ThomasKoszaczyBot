@@ -352,17 +352,32 @@ def partner_unlinked_by_other_text(other) -> str:
     return f"🔓 {_partner_display(other)} отвязал(а) партнёрский доступ — общие задачи больше не видны друг другу."
 
 
+# Реплики к партнёрским пушам — та же схема, что и у остальных пулов.
+SHARED_TASK_ADDED_PHRASES = [
+    "Общий вызов для вашей команды: «{title}». Кто сделает первый кусь задаче? 👥",
+    "Семейный гештальт маячит впереди: «{title}». Пора разобраться в четыре руки 🐾",
+]
+
+PARTNER_TASK_DONE_PHRASES = [
+    "Командная победа! Опыт начислен обоим 🐾",
+    "Совместный гештальт закрыт. Красота, когда работаете в паре ⚡️",
+    "Один за двоих — оба в плюсе. Отличная команда ✨",
+]
+
+
 def partner_new_shared_task_text(task_title: str) -> str:
     """Пуш партнёру, когда владелец делает задачу общей — при создании
     (ИИ сама определила по словам в тексте, или явный выбор "👥 Партнёру")
     либо позже из карточки (см. handlers/tasks.py::_notify_partner_shared)."""
-    return f"🐾 Партнёр добавил(а) общую задачу: «{escape(task_title)}» — уже в твоём списке!"
+    phrase = random.choice(SHARED_TASK_ADDED_PHRASES).format(title=escape(task_title))
+    return f"🐾 {phrase}\n<i>Уже в твоём списке!</i>"
 
 
 def partner_task_done_push_text(task_title: str, xp_amount: int) -> str:
     """Пуш партнёру, когда общую задачу закрыл ОН, а не сам получатель —
     XP при этом начисляется обоим (см. services/task_actions.py)."""
-    return f"🐾 Партнёр закрыл(а) общую задачу «{escape(task_title)}» — тебе тоже +{xp_amount} XP ✨"
+    phrase = random.choice(PARTNER_TASK_DONE_PHRASES)
+    return f"🐾 Партнёр закрыл(а) общую задачу «{escape(task_title)}» — тебе тоже +{xp_amount} XP ✨\n<i>{phrase}</i>"
 
 
 def welcome_text() -> str:
@@ -394,6 +409,23 @@ def task_added_text(title: str, priority: Priority) -> str:
         f"📌 «{escape(title)}»\n"
         f"<i>Приоритет: {label}</i>"
     )
+
+
+# Реплики-подтверждения, когда ИИ сама распознала дату/приоритет/общность
+# из сообщения (см. handlers/tasks.py::_create_task_with_ai) — идут ПЕРЕД
+# task_added_text/deadline-строкой, а не вместо них, просто заменяют сухое
+# "🤖 Распознала из сообщения:"/"🤖 Заметила дату в сообщении." на тёплую
+# реплику по той же схеме, что и остальные пулы.
+TASK_CREATED_AI_PHRASES = [
+    "Поймал мысль за хвост и аккуратно разложил по полочкам! 🐾",
+    "Записал на лапку. Всё чисто, красиво и без лишней суеты ✨",
+    "Скинуто на хранение. Томас на страже твоих планов 🐟",
+]
+
+
+def random_ai_recognized_phrase() -> str:
+    """Случайная реплика-подтверждение для ИИ-разбора (см. TASK_CREATED_AI_PHRASES)."""
+    return random.choice(TASK_CREATED_AI_PHRASES)
 
 
 def task_urgency_category(task) -> int:
@@ -760,6 +792,20 @@ def habit_delete_confirm_text(title: str) -> str:
     return f"🗑 Точно удалить рутину «{escape(title)}» насовсем? Это нельзя отменить."
 
 
+# Вариативные "хвостики" утреннего/вечернего пуша чек-листа — сама цифра
+# (сколько дел/закрыто) остаётся фиксированной и честной, меняется только
+# тёплая концовка фразы, чтобы пуш не звучал одинаково каждый день.
+MORNING_DIGEST_TAILS = [
+    "Заглянем?",
+    "Никакой спешки, вкатываемся в ритм на мягких лапках ☕️",
+]
+
+EVENING_DIGEST_TAILS = [
+    "Время отдыхать ✨",
+    "Незакрытые дела никуда не убегут — я придержу их в бэклоге. Сворачивайся калачиком, время отдыхать ✨",
+]
+
+
 def checklist_morning_push_text(task_count: int) -> str:
     """
     Утренний пуш-приглашение в интерактивный чек-лист (~09:00) — короткий
@@ -770,7 +816,8 @@ def checklist_morning_push_text(task_count: int) -> str:
     if task_count <= 0:
         return "Доброе утро! ☀️ На сегодня горящих дел нет — можно выбрать спокойный темп. Заглянем в чек-лист? 🐾"
     word = _pluralize_tasks_word(task_count)
-    return f"Доброе утро! ☀️ Чек-лист на сегодня готов. В фокусе {task_count} {word}. Заглянем?"
+    tail = random.choice(MORNING_DIGEST_TAILS)
+    return f"Доброе утро! ☀️ Чек-лист на сегодня готов. В фокусе {task_count} {word}. {tail}"
 
 
 def _pluralize_tasks_word(n: int) -> str:
@@ -794,9 +841,10 @@ def checklist_evening_push_text(done_count: int, total_count: int, xp_earned: in
     """
     if total_count <= 0:
         return "День подходит к концу 🐾 На сегодня в чек-листе ничего не было запланировано. Время отдыхать ✨"
+    tail = random.choice(EVENING_DIGEST_TAILS)
     return (
         f"День подходит к концу 🐾 Сегодня закрыто {done_count} из {total_count} пунктов "
-        f"(+{xp_earned} XP в копилку). Время отдыхать ✨"
+        f"(+{xp_earned} XP в копилку). {tail}"
     )
 
 
@@ -969,21 +1017,54 @@ def deadline_saved_text(
 # толчок взяться за дело ПРЯМО СЕЙЧАС (в отличие от QUICK_CLOSE_PHRASES
 # выше, которые звучат уже ПОСЛЕ закрытия задачи). Тот же принцип "без
 # упрёков и давления" — это приглашение, а не будильник с претензией.
-REMINDER_PUSH_PHRASES = [
-    "Лапки в готовности — самое время взяться за дело ✨",
-    "Маленький шаг сейчас — и с плеч долой 🐾",
-    "Ты справишься быстрее, чем кажется. Погнали? ⚡️",
-    "Всего пара минут — и это уже позади 🌿",
-    "Хороший момент, чтобы закрыть один хвостик 🐾",
-    "Фокус включён? Тогда вперёд, я рядом ✨",
-    "Небольшое дело — а порядка в мыслях сразу больше 🎯",
-    "Самое время — не будем откладывать в долгий ящик 🐾",
+#
+# Три отдельных пула вместо одного (см. random_reminder_push_phrase ниже):
+# - REMINDER_ADVANCE_PHRASES — заблаговременное напоминание (за N дней/
+#   часов/минут, offset != exact), спокойный "держу в курсе" тон.
+# - REMINDER_DEADLINE_PHRASES — сам момент дедлайна (offset == exact),
+#   тон динамичнее, с явной поддержкой "первого шага".
+# - SHARED_REMINDER_PHRASES — задача общая (Task.shared) — берётся ВМЕСТО
+#   двух предыдущих независимо от offset: тут важнее напомнить, что дело
+#   касается обоих, а не когда именно оно горит.
+# Все три поддерживают {title} (см. escape() в самой функции ниже — сама
+# фраза встраивается в HTML-разметку сообщения).
+REMINDER_ADVANCE_PHRASES = [
+    "Хвостик дела уже показался на горизонте. Не дёргайся, просто держу в курсе 🐾",
+    "Через часик у нас по плану пункт: «{title}». Допивай чай, морально настраиваемся ✨",
+    "Мягкий маячок: скоро займёмся делом. Никакой спешки, мы в графике ☕️",
+    "Закинул напоминалку на край стола: через 15 минут пора браться за работу 🐾",
+]
+
+REMINDER_DEADLINE_PHRASES = [
+    "Время пришло! Самое сложное — сделать первый двухминутный шаг. Лапки сжаты за тебя ✨",
+    "Пора браться за «{title}». Сделаем налегке, закроем гештальт и пойдём законно отдыхать?",
+    "Задачка смотрит на тебя в упор. Если совсем нет ресурса — нажми перенос, без самобичевания 🐾",
+    "Один быстрый рывок — и эта гора с плеч. Я посижу рядом, пока ты справляешься ✨",
+]
+
+SHARED_REMINDER_PHRASES = [
+    "Общий вызов для вашей команды: «{title}». Кто сделает первый кусь задаче? 👥",
+    "Семейный гештальт маячит впереди: «{title}». Пора разобраться в четыре руки 🐾",
+    "Напоминаю вам обоим: пора закрыть «{title}». Вместе быстрее, а потом — заслуженный отдых ✨",
 ]
 
 
-def random_reminder_push_phrase() -> str:
-    """Случайная реплика Томаса для пуш-уведомления (см. REMINDER_PUSH_PHRASES)."""
-    return random.choice(REMINDER_PUSH_PHRASES)
+def random_reminder_push_phrase(task, offset: ReminderOffset) -> str:
+    """
+    Случайная реплика Томаса для пуш-уведомления о напоминании — выбор
+    пула зависит от того, общая ли это задача (см. SHARED_REMINDER_PHRASES,
+    имеет приоритет над типом смещения) и наступил ли уже сам дедлайн
+    (REMINDER_DEADLINE_PHRASES) или это ещё заблаговременное предупреждение
+    (REMINDER_ADVANCE_PHRASES). {title} внутри фразы подставляется уже
+    экранированным (см. escape) — сама фраза идёт в HTML-сообщение.
+    """
+    if task.shared:
+        pool = SHARED_REMINDER_PHRASES
+    elif offset == ReminderOffset.exact:
+        pool = REMINDER_DEADLINE_PHRASES
+    else:
+        pool = REMINDER_ADVANCE_PHRASES
+    return random.choice(pool).format(title=escape(task.title))
 
 
 def reminder_second_chance_text(task) -> str:
@@ -1093,7 +1174,7 @@ def reminder_notification_text(task, offset: ReminderOffset) -> str:
     тексте, тыкать нужно ровно то же самое.
     """
     xp_amount = XP_BY_PRIORITY.get(task.priority, XP_PER_TASK)
-    phrase = random_reminder_push_phrase()
+    phrase = random_reminder_push_phrase(task, offset)
 
     if offset == ReminderOffset.exact:
         lines = [
@@ -1119,13 +1200,30 @@ def reminder_notification_text(task, offset: ReminderOffset) -> str:
     return "\n".join(lines)
 
 
+# Анти-шейминг реплики для "💤 Отложить" — принцип тот же, что и везде:
+# перенос дела не повод для чувства вины, это забота о себе, а не срыв.
+SNOOZE_PHRASES = [
+    "Сдвинул! Главное — не перегружать лапки. Вернёмся со свежей головой ☕️",
+    "Отложили без драмы. Защита внутренней батарейки — это тоже часть продуктивности ✨",
+    "Принято. Задачка спокойно подождёт на полочке, отдыхай без чувства вины 🐾",
+    "Отрегулировали таймер. Никакого давления, всё под контролем 🛋",
+]
+
+
+def random_snooze_phrase() -> str:
+    """Случайная анти-шейминг реплика при переносе напоминания (см. SNOOZE_PHRASES)."""
+    return random.choice(SNOOZE_PHRASES)
+
+
 def snooze_confirmed_text(new_time) -> str:
     """
     Подтверждение переноса напоминания (см. handlers/tasks.py::
     snz_quick/snz_tmr/td_confirm при CTX_SNOOZE) — твоя формулировка
-    "Договорились, напомню в ..." вместо сухого "Напоминание перенесено на".
+    "Договорились, напомню в ..." вместо сухого "Напоминание перенесено на",
+    плюс случайная анти-шейминг реплика (см. SNOOZE_PHRASES) — перенос не
+    повод для чувства вины.
     """
-    return f"💤 Договорились, напомню {format_deadline(new_time)} 🐾"
+    return f"💤 Договорились, напомню {format_deadline(new_time)} 🐾\n<i>{random_snooze_phrase()}</i>"
 
 
 def card_deadline_text(task) -> str:
