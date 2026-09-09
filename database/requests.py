@@ -406,6 +406,80 @@ async def has_effective_premium(user_id: int) -> bool:
         return partner is not None and is_premium_active(partner)
 
 
+# --- Лимиты бесплатного тарифа (см. roadmap_premium.html, финальная таблица
+# Free/Premium) -----------------------------------------------------------
+#
+# Три отдельных лимита, все по одной и той же схеме: Premium (has_effective_
+# premium — своё или партнёра) снимает ограничение полностью, иначе считаем
+# что-то простое и сравниваем с константой ниже. Константы — единственное
+# место, где их нужно менять, если решим пересчитать цифры.
+FREE_AI_PARSES_LIMIT = 5
+FREE_ACTIVE_TASKS_LIMIT = 7
+FREE_HABITS_LIMIT = 3
+
+
+async def can_use_ai_parse(user_id: int) -> bool:
+    """
+    Можно ли потратить ИИ-разбор текста/голоса на эту задачу: Premium
+    (свой или партнёра) — да всегда, без счётчика вообще. Иначе — пока не
+    исчерпан бесплатный лимит FREE_AI_PARSES_LIMIT попыток (см.
+    User.free_ai_parses_used — общий счётчик на текст и голос вместе).
+    Вызывать ДО обращения к services.ai_parser — сама попытка уже стоит
+    денег на DeepSeek/Whisper, независимо от результата разбора.
+    """
+    if await has_effective_premium(user_id):
+        return True
+    user = await get_user(user_id)
+    return user is not None and user.free_ai_parses_used < FREE_AI_PARSES_LIMIT
+
+
+async def register_ai_parse_usage(user_id: int) -> None:
+    """
+    Засчитывает одну попытку ИИ-разбора в бесплатный лимит — вызывать
+    сразу ПОСЛЕ реального обращения к ИИ (см. can_use_ai_parse). Для
+    Premium (свой или партнёра) сама функция ничего не делает — счётчик
+    на них не действует и незачем лишний раз писать в БД на каждое
+    сообщение, которых у Premium-пользователей как раз больше всего.
+    """
+    if await has_effective_premium(user_id):
+        return
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is not None:
+            user.free_ai_parses_used += 1
+            await session.commit()
+
+
+async def can_create_task(user_id: int) -> bool:
+    """
+    Можно ли завести ещё одну активную задачу: Premium (свой или
+    партнёра) — без ограничений, иначе не больше FREE_ACTIVE_TASKS_LIMIT
+    уже активных задач в СВОЁМ списке (общие задачи партнёра в счёт не
+    идут — лимит про то, сколько человек сам заводит, а не про то, что
+    ему видно, см. get_active_tasks). Тех, кто уже накопил больше лимита
+    ДО его появления, не трогаем — просто новую сверху лимита завести
+    будет нельзя, старые никуда не денутся.
+    """
+    if await has_effective_premium(user_id):
+        return True
+    async with async_session() as session:
+        result = await session.execute(
+            select(func.count()).select_from(Task).where(
+                Task.user_id == user_id, Task.status == Status.in_progress
+            )
+        )
+        return result.scalar_one() < FREE_ACTIVE_TASKS_LIMIT
+
+
+async def can_create_habit(user_id: int) -> bool:
+    """Можно ли завести ещё одну привычку: Premium — без ограничений,
+    иначе не больше FREE_HABITS_LIMIT уже существующих."""
+    if await has_effective_premium(user_id):
+        return True
+    habits = await get_habits(user_id)
+    return len(habits) < FREE_HABITS_LIMIT
+
+
 async def create_partner_invite(user_id: int) -> str:
     """
     Выпускает новый код приглашения для диплинка (кнопка "🔗 Получить

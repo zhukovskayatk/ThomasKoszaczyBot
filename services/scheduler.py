@@ -70,6 +70,7 @@ from database.requests import (
     get_users_with_checklist_morning_push_enabled,
     get_users_with_morning_checklist_enabled,
     get_visible_habits_today,
+    has_effective_premium,
     mark_reminder_second_chance_sent,
     mark_reminder_sent,
     reschedule_reminder,
@@ -444,11 +445,15 @@ async def _daily_ticker() -> None:
             await _send_one_morning_checklist(user)
 
     for user in await get_users_with_checklist_morning_push_enabled():
-        if _matches_local_time(user, _CHECKLIST_MORNING_PUSH_TIME):
+        # Premium-фича (см. roadmap_premium.html) — утренний бриф и
+        # вечерняя сводка чек-листа теперь платные; сам переключатель в
+        # настройках уведомлений при этом не трогаем, чтобы после
+        # оформления Premium ничего не пришлось включать заново.
+        if _matches_local_time(user, _CHECKLIST_MORNING_PUSH_TIME) and await has_effective_premium(user.user_id):
             await _send_one_checklist_morning_brief(user)
 
     for user in await get_users_with_checklist_evening_push_enabled():
-        if _matches_local_time(user, _CHECKLIST_EVENING_PUSH_TIME):
+        if _matches_local_time(user, _CHECKLIST_EVENING_PUSH_TIME) and await has_effective_premium(user.user_id):
             await _send_one_checklist_evening_summary(user)
 
     for user in await get_all_users():

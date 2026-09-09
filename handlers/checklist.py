@@ -36,6 +36,8 @@ import texts
 from database.requests import (
     add_task,
     add_xp,
+    can_create_habit,
+    can_create_task,
     clear_task_reminders,
     create_habit,
     delete_habit,
@@ -101,21 +103,34 @@ async def try_handle_pending_text(message: Message) -> bool:
 
     kind, return_to = pending
     user_id = message.from_user.id
+    blocked_text: str | None = None
 
     if kind == "habit":
-        await create_habit(user_id=user_id, title=message.text)
+        if await can_create_habit(user_id):
+            await create_habit(user_id=user_id, title=message.text)
+        else:
+            # Бесплатный лимит привычек исчерпан (см.
+            # database.requests.FREE_HABITS_LIMIT) — ничего не создаём,
+            # просто объясняем почему и всё равно перерисовываем экран ниже.
+            blocked_text = texts.free_habit_limit_reached_text()
     else:
-        # Быстрое дело на сегодня — обычная задача с дедлайном "сегодня, в
-        # течение дня" (тот же формат, что и пресет "☀️ В течение дня" в
-        # мастере срока), проставляется сразу, без отдельного шага мастера.
-        task = await add_task(user_id=user_id, title=message.text)
-        today_end = datetime.combine(date.today(), datetime.max.time().replace(microsecond=0))
-        await set_task_deadline(task_id=task.task_id, user_id=user_id, deadline=today_end, all_day=True)
+        if await can_create_task(user_id):
+            # Быстрое дело на сегодня — обычная задача с дедлайном "сегодня, в
+            # течение дня" (тот же формат, что и пресет "☀️ В течение дня" в
+            # мастере срока), проставляется сразу, без отдельного шага мастера.
+            task = await add_task(user_id=user_id, title=message.text)
+            today_end = datetime.combine(date.today(), datetime.max.time().replace(microsecond=0))
+            await set_task_deadline(task_id=task.task_id, user_id=user_id, deadline=today_end, all_day=True)
+        else:
+            blocked_text = texts.free_task_limit_reached_text()
 
     if return_to == "edit":
         text, keyboard = await _edit_payload(user_id)
     else:
         text, keyboard = await _dashboard_payload(user_id)
+
+    if blocked_text:
+        await message.answer(blocked_text)
     await message.answer(text, reply_markup=keyboard)
     return True
 

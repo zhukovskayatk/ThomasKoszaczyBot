@@ -53,6 +53,8 @@ from database.requests import (
     add_reminder,
     add_task,
     available_reminder_offsets,
+    can_create_task,
+    can_use_ai_parse,
     clear_task_reminders,
     delete_task,
     get_active_tasks,
@@ -65,6 +67,7 @@ from database.requests import (
     get_user,
     has_effective_premium,
     recompute_reminders_for_new_deadline,
+    register_ai_parse_usage,
     remove_reminder,
     set_task_deadline,
     set_task_priority,
@@ -102,6 +105,7 @@ from keyboards import (
 )
 from handlers import checklist
 from services import ai_parser, timeutils
+from services import voice as voice_service
 from services.meme_manager import get_success_reward
 from services.task_actions import complete_task_core
 
@@ -132,17 +136,21 @@ class _QuickCloseSession:
 _quick_close_sessions: dict[tuple[int, int], _QuickCloseSession] = {}
 
 
-async def confirm_task_added(message: Message, task) -> None:
+async def confirm_task_added(message: Message, task, note: str | None = None) -> None:
     """
     Лаконичное подтверждение после создания задачи + выбор приоритета.
     Кнопки "Выполнено" тут больше нет — закрывать задачу сразу же после
     создания незачем, для этого есть отдельный сценарий "🎉 Я сделал!".
+
+    note — необязательная короткая приписка под подтверждением (сейчас
+    единственный случай — texts.free_ai_limit_reached_text, когда
+    бесплатный лимит ИИ-разбора уже исчерпан, см. _create_task_with_ai).
     """
     keyboard = priority_keyboard(task.task_id)
-    await message.answer(
-        texts.task_added_text(task.title, task.priority),
-        reply_markup=keyboard.as_markup(),
-    )
+    text = texts.task_added_text(task.title, task.priority)
+    if note:
+        text = f"{text}\n\n{note}"
+    await message.answer(text, reply_markup=keyboard.as_markup())
 
 
 def _split_tasks_by_filter(tasks: list, viewer_user_id: int) -> dict:
@@ -394,6 +402,10 @@ async def cmd_add(message: Message, command: CommandObject) -> None:
             "Напиши, что нужно сделать, после команды.\n"
             "Например: /add Помыть посуду"
         )
+        return
+
+    if not await can_create_task(message.from_user.id):
+        await message.answer(texts.free_task_limit_reached_text(), reply_markup=main_menu_keyboard)
         return
 
     task = await add_task(user_id=message.from_user.id, title=task_text)
@@ -689,25 +701,108 @@ async def add_task_from_text(message: Message) -> None:
         )
         return
 
+    if not await can_create_task(user_id):
+        await message.answer(texts.free_task_limit_reached_text(), reply_markup=main_menu_keyboard)
+        return
+
     task = await add_task(user_id=user_id, title=message.text)
-    await _create_task_with_ai(message, task)
+    await _create_task_with_ai(message, task, source_text=message.text)
+
+
+# --- Создание задачи из голосового сообщения (распознавание речи) -------------
+
+@router.message(F.voice)
+async def add_task_from_voice(message: Message) -> None:
+    """
+    Голосовое сообщение → Whisper (см. services.voice) → та же логика
+    создания задачи, что и у обычного текста (services.ai_parser +
+    _create_task_with_ai) — просто вместо message.text распознанный текст.
+
+    Отдельный, более строгий порядок проверок по сравнению с текстом:
+    само распознавание речи стоит денег на КАЖДОЕ голосовое сообщение
+    (в отличие от текста, где бесплатна сама печать, а платный только
+    "умный" разбор через DeepSeek) — поэтому лимит ИИ проверяем ДО
+    обращения к Whisper, а не после, чтобы не тратить деньги впустую на
+    того, кому всё равно откажем.
+    """
+    user_id = message.from_user.id
+
+    # Голосом сюда попадают и те, кто в этот момент ждал текстового ввода
+    # для чек-листа (см. handlers/checklist.py::_pending_add — "напиши
+    # название рутины"/"дело на сегодня"): раз пришёл голос, а не текст,
+    # try_handle_pending_text его никогда не увидит — сбрасываем "ожидание"
+    # сами, иначе оно неожиданно "выстрелило" бы на следующее обычное
+    # текстовое сообщение этого человека.
+    checklist._pending_add.pop(user_id, None)
+
+    if not await can_use_ai_parse(user_id):
+        await message.answer(texts.free_voice_limit_reached_text())
+        return
+
+    if not await can_create_task(user_id):
+        await message.answer(texts.free_task_limit_reached_text(), reply_markup=main_menu_keyboard)
+        return
+
+    file_info = await message.bot.get_file(message.voice.file_id)
+    audio_file = await message.bot.download_file(file_info.file_path)
+    transcribed = await voice_service.transcribe_voice(audio_file.read())
+    # Одна попытка распознавания = один кредит из бесплатного лимита,
+    # независимо от того, удалось ли реально что-то разобрать (Whisper уже
+    # был вызван и уже стоит денег) — см. _create_task_with_ai про то, что
+    # дальше DeepSeek-разбор этого же текста кредит уже не тратит повторно.
+    await register_ai_parse_usage(user_id)
+
+    if not transcribed:
+        await message.answer(texts.voice_transcription_unavailable_text())
+        return
+
+    task = await add_task(user_id=user_id, title=transcribed)
+    await _create_task_with_ai(message, task, source_text=transcribed, charge_ai_credit=False)
 
 
 # --- Распознавание даты/приоритета из текста через ИИ (DeepSeek) --------------
 
-async def _create_task_with_ai(message: Message, task) -> None:
+async def _create_task_with_ai(
+    message: Message, task, source_text: str, charge_ai_credit: bool = True
+) -> None:
     """
-    Пробует распознать в исходном тексте сообщения дедлайн и/или приоритет
-    (см. services.ai_parser) и, если получилось, применяет их сразу к уже
+    Пробует распознать в исходном тексте дедлайн и/или приоритет (см.
+    services.ai_parser) и, если получилось, применяет их сразу к уже
     созданной задаче — без лишних шагов мастера там, где ИИ и так всё понял.
 
     Если ИИ недоступен (нет ключа, нет сети, непонятный ответ) — просто
     ведём себя как раньше: показываем обычное подтверждение с выбором
     приоритета (confirm_task_added).
+
+    source_text — что именно разбирать: для обычного текстового сообщения
+    это message.text, для голосового — уже распознанный Whisper'ом текст
+    (см. add_task_from_voice; у voice-сообщений message.text всегда None).
+
+    charge_ai_credit — списывать ли попытку из бесплатного лимита ИИ ЗДЕСЬ
+    (см. can_use_ai_parse/register_ai_parse_usage). False — только для
+    голосового пути: там кредит уже списан за само распознавание речи (оно
+    и есть дорогая часть), и одно голосовое сообщение должно стоить ОДИН
+    кредит суммарно, а не два (распознавание + этот разбор).
     """
     user_id = task.user_id
+
+    if charge_ai_credit and not await can_use_ai_parse(user_id):
+        # Бесплатный лимит ИИ-разбора исчерпан (см.
+        # database.requests.FREE_AI_PARSES_LIMIT) — задача уже создана
+        # (add_task_from_text выше), просто дальше ведём себя как при
+        # недоступном ИИ (без ключа/без сети): обычное подтверждение с
+        # ручным выбором приоритета, только ещё и объясняем почему.
+        await confirm_task_added(message, task, note=texts.free_ai_limit_reached_text())
+        return
+
     tz_offset = await _user_offset(user_id)
-    parsed = await ai_parser.parse_task_message(message.text, now=timeutils.user_now(tz_offset))
+    parsed = await ai_parser.parse_task_message(source_text, now=timeutils.user_now(tz_offset))
+    if charge_ai_credit:
+        # Считаем саму ПОПЫТКУ в лимит сразу после реального обращения к
+        # ИИ — она уже стоит денег на DeepSeek, независимо от того,
+        # разобрал ли ИИ что-то полезное (для Premium — no-op, см.
+        # register_ai_parse_usage).
+        await register_ai_parse_usage(user_id)
 
     if parsed is None:
         await confirm_task_added(message, task)

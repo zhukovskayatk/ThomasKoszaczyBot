@@ -210,6 +210,18 @@ class User(Base):
     # сменить его под себя (например, если в отъезде).
     utc_offset_minutes: Mapped[int] = mapped_column(default=180)
 
+    # --- Лимиты бесплатного тарифа (см. roadmap_premium.html, финальная
+    # таблица Free/Premium, и database/requests.py::FREE_*_LIMIT) ------------
+    # free_ai_parses_used — сколько раз пользователь БЕЗ эффективного
+    # Premium (см. has_effective_premium) уже воспользовался ИИ-разбором
+    # даты/приоритета/общности из сообщения (см. handlers/tasks.py::
+    # _create_task_with_ai) — общий счётчик на текст и голос вместе, растёт
+    # на каждую РЕАЛЬНУЮ попытку обращения к ИИ (она уже стоит денег,
+    # независимо от того, разобрал ли ИИ что-то полезное). Для тех, у кого
+    # есть эффективный Premium, вообще не растёт и не проверяется — лимита
+    # на них нет.
+    free_ai_parses_used: Mapped[int] = mapped_column(default=0)
+
     # Связь "один пользователь — много задач"
     tasks: Mapped[list["Task"]] = relationship(back_populates="user")
 
@@ -405,6 +417,10 @@ async def _migrate_missing_columns(conn) -> None:
     if "utc_offset_minutes" not in existing_user_columns:
         await conn.exec_driver_sql(
             "ALTER TABLE users ADD COLUMN utc_offset_minutes INTEGER NOT NULL DEFAULT 180"
+        )
+    if "free_ai_parses_used" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN free_ai_parses_used INTEGER NOT NULL DEFAULT 0"
         )
 
     result = await conn.exec_driver_sql("PRAGMA table_info(tasks)")

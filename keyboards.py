@@ -758,9 +758,11 @@ def notification_settings_keyboard(
 
     Два новых пункта (утренний/вечерний пуш чек-листа дня) — НЕ то же
     самое, что "Утренний чек-лист (09:00)" выше: тот — пассивный текстовый
-    дайджест, эти два — приглашения в интерактивный экран "☀️ Чек-лист дня"
-    (см. services.scheduler._send_checklist_morning_briefs/
-    _send_checklist_evening_summaries).
+    дайджест (бесплатно у всех), эти два — приглашения в интерактивный
+    экран "☀️ Чек-лист дня" и теперь Premium-фича (метка 💎 в подписи, см.
+    services.scheduler._daily_ticker — реально приходят только при
+    активном эффективном Premium, сам переключатель при этом можно
+    держать включённым заранее).
     """
     builder = InlineKeyboardBuilder()
     morning_mark = "☑️" if morning_checklist_enabled else "◻️"
@@ -772,11 +774,11 @@ def notification_settings_keyboard(
     builder.button(text=f"{reminders_mark} Напоминания по задачам", callback_data="notif_toggle:reminders")
     builder.button(text=f"{quiet_mark} 🌙 Тихие часы (22:00–08:00)", callback_data="notif_toggle:quiet")
     builder.button(
-        text=f"{checklist_morning_mark} ☀️ Приглашение в чек-лист (09:00)",
+        text=f"{checklist_morning_mark} ☀️ Приглашение в чек-лист (09:00) 💎",
         callback_data="notif_toggle:checklist_morning",
     )
     builder.button(
-        text=f"{checklist_evening_mark} 🌙 Вечерняя сводка чек-листа (21:00)",
+        text=f"{checklist_evening_mark} 🌙 Вечерняя сводка чек-листа (21:00) 💎",
         callback_data="notif_toggle:checklist_evening",
     )
     builder.button(text="◀️ Назад к профилю", callback_data="notif_back")
