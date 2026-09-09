@@ -172,6 +172,27 @@ def priority_keyboard(task_id: int) -> InlineKeyboardBuilder:
     return builder
 
 
+def sharing_choice_keyboard(task_id: int) -> InlineKeyboardBuilder:
+    """
+    Шаг "Личное/Партнёр" мастера создания задачи (см. handlers/tasks.py::
+    _offer_sharing_or_finish/share_choice) — показывается ТОЛЬКО когда у
+    создателя активен Premium И уже есть привязанный партнёр (иначе шаг
+    целиком пропускается, задача остаётся личной по умолчанию, как и
+    раньше). Две кнопки, без промежуточных состояний — ровно как просила
+    пользовательница: либо "🔒 Личное", либо "👥 Партнёру" (общий список на
+    двоих), никаких дополнительных настроек видимости.
+
+    Позже категорию всё ещё можно сменить из уже открытой карточки задачи
+    (см. task_card_keyboard/card_toggle_shared) — этот шаг только задаёт
+    исходное значение при создании.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔒 Личное", callback_data=f"share_choice:{task_id}:personal")
+    builder.button(text="👥 Партнёру", callback_data=f"share_choice:{task_id}:shared")
+    builder.adjust(2)
+    return builder
+
+
 def quick_close_session_keyboard(
     remaining_tasks: list, has_progress: bool, viewer_user_id: int | None = None
 ) -> InlineKeyboardBuilder:

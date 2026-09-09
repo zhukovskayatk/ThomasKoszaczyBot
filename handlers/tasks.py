@@ -57,6 +57,7 @@ from database.requests import (
     delete_task,
     get_active_tasks,
     get_active_tasks_by_deadline,
+    get_partner,
     get_reminder_with_task,
     get_streak_status,
     get_task,
@@ -67,6 +68,7 @@ from database.requests import (
     remove_reminder,
     set_task_deadline,
     set_task_priority,
+    set_task_shared,
     toggle_task_shared,
     update_task_title,
 )
@@ -89,6 +91,7 @@ from keyboards import (
     reminder_notification_keyboard,
     reminders_keyboard,
     shift_month,
+    sharing_choice_keyboard,
     snooze_menu_keyboard,
     task_card_keyboard,
     tasks_page_keyboard,
@@ -218,6 +221,55 @@ async def _finish_wizard(callback: CallbackQuery, text: str, reply_markup=None) 
         await callback.message.answer(text, reply_markup=reply_markup)
     except TelegramBadRequest:
         await callback.message.edit_text(text, reply_markup=reply_markup)
+
+
+async def _offer_sharing_or_finish(callback: CallbackQuery, task) -> None:
+    """
+    Последний шаг мастера создания задачи (CTX_NEW), общий для всех трёх
+    путей завершения (без дедлайна — wiz_cancel/cal_none, с дедлайном и
+    напоминаниями — rmd_done): либо показывает шаг "Личное/Партнёр" (см.
+    keyboards.sharing_choice_keyboard), либо, если он не нужен, сразу
+    завершает мастер финальной карточкой — ровно как раньше.
+
+    Шаг показывается ТОЛЬКО когда у создателя одновременно активен Premium
+    И уже есть привязанный партнёр — для подавляющего большинства
+    пользователей (нет партнёра или нет Premium) поведение не меняется
+    вообще: задача остаётся личной по умолчанию, шаг просто пропускается.
+    Как и решила пользовательница — никаких дополнительных настроек
+    видимости, только явный выбор между "🔒 Личное" и "👥 Партнёру".
+    """
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    partner = await get_partner(user_id)
+
+    if not (user and is_premium_active(user) and partner is not None):
+        await _finish_wizard(callback, texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day))
+        return
+
+    await _finish_wizard(
+        callback,
+        texts.sharing_choice_prompt_text(task.title),
+        sharing_choice_keyboard(task.task_id).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("share_choice:"))
+async def share_choice(callback: CallbackQuery) -> None:
+    """Обработка выбора "🔒 Личное" / "👥 Партнёру" на последнем шаге мастера
+    создания задачи (см. _offer_sharing_or_finish/keyboards.sharing_choice_keyboard)."""
+    _, task_id_str, choice = callback.data.split(":", maxsplit=2)
+    task_id, user_id = int(task_id_str), callback.from_user.id
+
+    task = await set_task_shared(task_id=task_id, user_id=user_id, shared=(choice == "shared"))
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer("Готово! 🎉")
+    await _finish_wizard(
+        callback,
+        texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day, shared=task.shared),
+    )
 
 
 # --- Создание задачи через команду /add --------------------------------------
@@ -677,7 +729,7 @@ async def wiz_cancel(callback: CallbackQuery) -> None:
 
     if context == CTX_NEW:
         await callback.answer("Ок, без дедлайна")
-        await _finish_wizard(callback, texts.deadline_saved_text(task.title, task.priority, None))
+        await _offer_sharing_or_finish(callback, task)
         return
 
     # CTX_EDIT — возвращаемся на карточку задачи без изменений.
@@ -835,7 +887,7 @@ async def cal_none(callback: CallbackQuery) -> None:
     await callback.answer("Сохранено без срока")
 
     if context == CTX_NEW:
-        await _finish_wizard(callback, texts.deadline_saved_text(task.title, task.priority, None))
+        await _offer_sharing_or_finish(callback, task)
     else:  # CTX_EDIT — возвращаемся на карточку задачи
         reminders = await get_task_reminders(task_id)
         shared_by_partner, can_toggle_shared = await _task_card_extras(task, callback.from_user.id)
@@ -1117,10 +1169,7 @@ async def rmd_done(callback: CallbackQuery) -> None:
     await callback.answer("Готово! 🎉")
 
     if context == CTX_NEW:
-        await _finish_wizard(
-            callback,
-            texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day),
-        )
+        await _offer_sharing_or_finish(callback, task)
         return
 
     reminders = await get_task_reminders(task_id)

@@ -863,6 +863,27 @@ async def set_task_deadline(
         return True
 
 
+async def set_task_shared(task_id: int, user_id: int, shared: bool) -> Task | None:
+    """
+    Явно выставляет "личная/общая" (Task.shared) в конкретное значение —
+    в отличие от toggle_task_shared (переключает наоборот), используется
+    шагом "Личное/Партнёр" в мастере создания задачи (handlers/tasks.py::
+    _offer_sharing_or_finish/share_choice), где выбор всегда явный
+    ("🔒 Личное" или "👥 Партнёру"), а не переключение состояния. Как и
+    toggle_task_shared — доступно ТОЛЬКО настоящему владельцу задачи.
+    Возвращает обновлённую задачу, либо None, если задача не найдена или
+    user_id не её владелец.
+    """
+    async with async_session() as session:
+        task = await session.get(Task, task_id)
+        if task is None or task.user_id != user_id:
+            return None
+        task.shared = shared
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+
 async def toggle_task_shared(task_id: int, user_id: int) -> Task | None:
     """
     Переключает "личная/общая" (Task.shared) — В ОТЛИЧИЕ от остальных

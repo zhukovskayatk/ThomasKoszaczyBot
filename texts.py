@@ -785,7 +785,19 @@ def reminders_prompt_text(title: str, deadline, all_day: bool = False) -> str:
     )
 
 
-def deadline_saved_text(title: str, priority: Priority, deadline, all_day: bool = False) -> str:
+def sharing_choice_prompt_text(title: str) -> str:
+    """Приглашение выбрать категорию "Личное/Партнёр" — последний шаг
+    мастера создания задачи (см. handlers/tasks.py::_offer_sharing_or_finish),
+    показывается только при активном Premium и уже привязанном партнёре."""
+    return (
+        f"✨ <b>Записал: «{escape(title)}»</b>\n\n"
+        "Это личная задача или общая с партнёром?"
+    )
+
+
+def deadline_saved_text(
+    title: str, priority: Priority, deadline, all_day: bool = False, shared: bool = False
+) -> str:
     """Финальная карточка задачи после завершения всего мастера дедлайна
     (только для сценария создания новой задачи — CTX_NEW)."""
     base = (
@@ -793,6 +805,8 @@ def deadline_saved_text(title: str, priority: Priority, deadline, all_day: bool 
         f"📌 «{escape(title)}»\n"
         f"<i>Приоритет: {PRIORITY_LABELS[priority]}</i>"
     )
+    if shared:
+        base += "\n👥 <i>Общая с партнёром</i>"
     if deadline is None:
         return base + "\n⏳ <i>Срок: Без дедлайна (сделаем, когда будет настрой ✨)</i>"
     return base + f"\n⏳ <i>Срок: {format_deadline(deadline, all_day)}</i>"
