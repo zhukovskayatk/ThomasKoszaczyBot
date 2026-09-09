@@ -19,6 +19,7 @@ from database.requests import (
     create_partner_invite,
     get_or_create_user,
     get_partner,
+    has_effective_premium,
     is_premium_active,
     unlink_partner,
 )
@@ -28,8 +29,11 @@ router = Router(name="partner")
 
 
 async def show_partner_screen(message: Message, user_id: int) -> None:
-    user = await get_or_create_user(user_id=user_id, username=message.from_user.username)
-    is_premium = is_premium_active(user)
+    await get_or_create_user(user_id=user_id, username=message.from_user.username)
+    # has_effective_premium (не is_premium_active!) — иначе непремиумный
+    # партнёр, подключённый по чужой подписке, видел бы себя тут как будто
+    # без пары вообще, хотя общий список у него уже вовсю работает.
+    is_premium = await has_effective_premium(user_id)
     partner = await get_partner(user_id) if is_premium else None
     await message.answer(
         texts.partner_screen_text(is_premium, partner),
@@ -54,7 +58,7 @@ async def partner_go_premium(callback: CallbackQuery) -> None:
     from handlers import subscription  # локальный импорт — без цикла (subscription не знает про partner)
 
     await callback.answer()
-    await subscription.show_premium_screen(callback.message)
+    await subscription.show_premium_screen(callback.message, callback.from_user.id, callback.from_user.username)
 
 
 @router.callback_query(F.data == "partner_invite")

@@ -87,12 +87,19 @@ CTX_SNOOZE = "snz"
 
 # --- Постоянная клавиатура (под полем ввода) ----------------------------------
 
+# Разгрузка нижнего меню: было 7 кнопок в 4 ряда (почти треть экрана
+# телефона) — 💎 Premium и 👥 Партнёр отсюда убраны совсем и переехали
+# инлайн-кнопками под "👤 Профиль и Настройки" (см. profile_actions_keyboard
+# и handlers/profile.py::show_profile) — они нужны редко, а партнёрские
+# задачи и так видны в обычном "📋 Задачи" и в "☀️ Чек-листе" без отдельного
+# захода на экран партнёра. Константы PREMIUM_BUTTON_TEXT/PARTNER_BUTTON_TEXT
+# при этом не удалены — на них всё ещё завязаны обработчики текста в
+# subscription.py/partner.py, они просто больше не показаны на кнопке.
 main_menu_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=TASKS_BUTTON_TEXT), KeyboardButton(text=ADD_BUTTON_TEXT)],
         [KeyboardButton(text=QUICK_CLOSE_BUTTON_TEXT), KeyboardButton(text=CHECKLIST_BUTTON_TEXT)],
-        [KeyboardButton(text=PROFILE_BUTTON_TEXT), KeyboardButton(text=PREMIUM_BUTTON_TEXT)],
-        [KeyboardButton(text=PARTNER_BUTTON_TEXT)],
+        [KeyboardButton(text=PROFILE_BUTTON_TEXT)],
     ],
     resize_keyboard=True,
 )
@@ -100,14 +107,17 @@ main_menu_keyboard = ReplyKeyboardMarkup(
 
 def premium_buy_keyboard(is_active: bool) -> InlineKeyboardBuilder:
     """
-    Кнопка на экране "💎 Premium". Текст меняется в зависимости от того,
-    активна ли подписка уже сейчас (см. handlers/subscription.py) — купить
-    первый раз или продлить действующую формулируются по-разному, хотя
-    технически это один и тот же callback ("premium_buy").
+    Две кнопки на экране "💎 Premium" — месяц и год (см.
+    handlers/subscription.py::_PERIODS) — подпись меняется в зависимости
+    от того, активна ли подписка уже сейчас: купить первый раз или
+    продлить действующую (дни в любом случае добавляются к уже
+    оплаченному сроку, см. database.requests.extend_premium).
     """
     builder = InlineKeyboardBuilder()
-    label = "🔄 Продлить Premium" if is_active else "💎 Оформить Premium"
-    builder.button(text=label, callback_data="premium_buy")
+    verb = "Продлить" if is_active else "Оформить"
+    builder.button(text=f"💎 {verb}: месяц — 249⭐", callback_data="premium_buy:month")
+    builder.button(text=f"💎 {verb}: год — 1990⭐", callback_data="premium_buy:year")
+    builder.adjust(1)
     return builder
 
 
@@ -253,17 +263,43 @@ def _task_button_label(task, viewer_user_id: int | None = None) -> str:
     return f"{marker} {partner_marker}{short_title}"
 
 
+# Вкладки-фильтры над списком "📋 Мои задачи" (см. tasks_page_keyboard) —
+# показываются только тем, у кого есть привязанный партнёр (иначе "Мои"/
+# "Общие" ничего бы не значили). "Мои" — строго личные (не общие) задачи
+# самого viewer'а, "Общие" — все общие сразу (свои общие + партнёрские),
+# без пересечений с "Мои", так что "Мои" + "Общие" всегда равно "Все".
+TASKS_FILTER_ALL = "all"
+TASKS_FILTER_MINE = "mine"
+TASKS_FILTER_SHARED = "shared"
+_TASKS_FILTER_TABS = ((TASKS_FILTER_ALL, "📋 Все"), (TASKS_FILTER_MINE, "👤 Мои"), (TASKS_FILTER_SHARED, "👥 Общие"))
+
+
 def tasks_page_keyboard(
-    tasks_sorted: list, offset: int, viewer_user_id: int | None = None
+    tasks_sorted: list,
+    offset: int,
+    viewer_user_id: int | None = None,
+    task_filter: str = TASKS_FILTER_ALL,
+    show_filter_tabs: bool = False,
+    filter_counts: dict | None = None,
 ) -> tuple[InlineKeyboardBuilder, int]:
     """
     Строит одну "страницу" списка "📋 Мои задачи": каждая задача — кликабельная
     кнопка, открывающая её карточку (см. task_card_keyboard). tasks_sorted —
-    уже отсортированный по срочности список (get_active_tasks_by_deadline:
-    сначала просроченные/горящие сегодня, потом ближайшие дни по возрастанию
-    даты, потом без дедлайна — та же сортировка, что и маркеры на кнопках).
+    уже ОТФИЛЬТРОВАННЫЙ (по task_filter) и отсортированный по срочности
+    список (get_active_tasks_by_deadline: сначала просроченные/горящие
+    сегодня, потом ближайшие дни по возрастанию даты, потом без дедлайна —
+    та же сортировка, что и маркеры на кнопках) — фильтрация уже сделана
+    вызывающим кодом (handlers/tasks.py), сюда приходит готовый список.
 
     viewer_user_id — см. _task_button_label (маркер 👥 у общих задач партнёра).
+    show_filter_tabs/filter_counts — вкладки "Все/Мои/Общие" сверху (см.
+    _TASKS_FILTER_TABS); filter_counts — словарь {"all": n, "mine": n,
+    "shared": n} для подписи с числом на каждой вкладке.
+
+    Открытие карточки задачи (card_open) НЕ запоминает текущий фильтр —
+    "◀️ Назад к списку" из карточки всегда возвращает на "Все" (см.
+    task_card_keyboard) — сознательное упрощение, чтобы не тащить фильтр
+    ещё и через карточку с её десятком точек входа.
     """
     offset = max(0, offset)
     if tasks_sorted and offset >= len(tasks_sorted):
@@ -273,20 +309,29 @@ def tasks_page_keyboard(
     page = tasks_sorted[offset:offset + TASKS_PAGE_SIZE]
 
     builder = InlineKeyboardBuilder()
+    row_sizes = []
+
+    if show_filter_tabs:
+        counts = filter_counts or {}
+        for key, label in _TASKS_FILTER_TABS:
+            n = counts.get(key, 0)
+            text = f"• {label} ({n})" if key == task_filter else f"{label} ({n})"
+            builder.button(text=text, callback_data=f"tasks_page:0:{key}")
+        row_sizes.append(len(_TASKS_FILTER_TABS))
+
     for task in page:
         builder.button(
             text=_task_button_label(task, viewer_user_id), callback_data=f"card_open:{task.task_id}:{offset}"
         )
-
-    row_sizes = [1] * len(page)
+    row_sizes.extend([1] * len(page))
 
     has_prev = offset > 0
     has_next = offset + TASKS_PAGE_SIZE < len(tasks_sorted)
 
     if has_prev:
-        builder.button(text="⬅️ Назад", callback_data=f"tasks_page:{max(0, offset - TASKS_PAGE_SIZE)}")
+        builder.button(text="⬅️ Назад", callback_data=f"tasks_page:{max(0, offset - TASKS_PAGE_SIZE)}:{task_filter}")
     if has_next:
-        builder.button(text="➡️ Показать другие", callback_data=f"tasks_page:{offset + TASKS_PAGE_SIZE}")
+        builder.button(text="➡️ Показать другие", callback_data=f"tasks_page:{offset + TASKS_PAGE_SIZE}:{task_filter}")
 
     nav_count = int(has_prev) + int(has_next)
     if nav_count:
@@ -638,7 +683,9 @@ def task_card_keyboard(
         row_sizes.append(1)
 
     builder.button(text="🗑 Удалить", callback_data=f"card_delete:{task_id}")
-    builder.button(text="◀️ Назад к списку", callback_data=f"tasks_page:{offset}")
+    # ":all" — карточка не запоминает, из какой вкладки фильтра в неё зашли
+    # (см. tasks_page_keyboard), "Назад" всегда ведёт на полный список.
+    builder.button(text="◀️ Назад к списку", callback_data=f"tasks_page:{offset}:all")
     row_sizes += [1, 1]
     builder.adjust(*row_sizes)
     return builder
@@ -653,12 +700,21 @@ def delete_confirm_keyboard(task_id: int) -> InlineKeyboardBuilder:
     return builder
 
 
-def notifications_entry_keyboard() -> InlineKeyboardBuilder:
-    """Короткая подсказка под карточкой профиля — ведёт на экран 🔔 Уведомления
-    (см. handlers/profile.py::notif_open)."""
+def profile_actions_keyboard() -> InlineKeyboardBuilder:
+    """
+    Инлайн-кнопки под карточкой профиля (см. handlers/profile.py::
+    show_profile) — сюда переехали 💎 Premium и 👥 Партнёр из постоянной
+    нижней клавиатуры (main_menu_keyboard), плюс уже привычная 🔔
+    Уведомления. Все три ведут на уже существующие экраны:
+    - profile_partner → handlers/partner.py::show_partner_screen
+    - notif_open → handlers/profile.py::notif_open (без изменений)
+    - profile_premium → handlers/subscription.py::show_premium_screen
+    """
     builder = InlineKeyboardBuilder()
+    builder.button(text="👥 Мой партнёр", callback_data="profile_partner")
     builder.button(text="🔔 Уведомления", callback_data="notif_open")
-    builder.adjust(1)
+    builder.button(text="💎 Подписка", callback_data="profile_premium")
+    builder.adjust(2, 1)
     return builder
 
 

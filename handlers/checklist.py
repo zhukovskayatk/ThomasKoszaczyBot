@@ -28,6 +28,7 @@ _pending_rename в handlers/tasks.py. Сам перехват текста пр�
 from datetime import date, datetime
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
 import services.scheduler as scheduler_service
@@ -174,6 +175,15 @@ async def chk_ttoggle(callback: CallbackQuery) -> None:
     await callback.answer(f"✅ +{result.xp_amount} XP 🐾")
     if result.leveled_up:
         await callback.message.answer(texts.level_up_text(result.new_level))
+
+    if result.partner_notified is not None:
+        try:
+            await callback.bot.send_message(
+                result.partner_notified,
+                texts.partner_task_done_push_text(result.task_title, result.xp_amount),
+            )
+        except TelegramBadRequest:
+            pass
 
     text, keyboard = await _dashboard_payload(callback.from_user.id)
     await callback.message.edit_text(text, reply_markup=keyboard)

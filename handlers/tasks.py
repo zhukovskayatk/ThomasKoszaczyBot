@@ -62,8 +62,7 @@ from database.requests import (
     get_streak_status,
     get_task,
     get_task_reminders,
-    get_user,
-    is_premium_active,
+    has_effective_premium,
     recompute_reminders_for_new_deadline,
     remove_reminder,
     set_task_deadline,
@@ -82,6 +81,9 @@ from keyboards import (
     LEGACY_TASKS_BUTTON_TEXTS,
     QUICK_CLOSE_BUTTON_TEXT,
     TASKS_BUTTON_TEXT,
+    TASKS_FILTER_ALL,
+    TASKS_FILTER_MINE,
+    TASKS_FILTER_SHARED,
     calendar_keyboard,
     deadline_presets_keyboard,
     delete_confirm_keyboard,
@@ -142,7 +144,46 @@ async def confirm_task_added(message: Message, task) -> None:
     )
 
 
-async def show_tasks(message: Message) -> None:
+def _split_tasks_by_filter(tasks: list, viewer_user_id: int) -> dict:
+    """
+    Раскладывает уже полученный список (get_active_tasks_by_deadline —
+    свои + общие партнёра) на три вкладки фильтра списка задач (см.
+    keyboards.TASKS_FILTER_*): "Мои" — строго личные (не общие) задачи
+    самого viewer'а, "Общие" — вообще все общие, свои и партнёрские сразу
+    (пересечения с "Мои" нет, так что "Мои" + "Общие" == "Все").
+    """
+    mine = [t for t in tasks if t.user_id == viewer_user_id and not t.shared]
+    shared = [t for t in tasks if t.shared]
+    return {TASKS_FILTER_ALL: tasks, TASKS_FILTER_MINE: mine, TASKS_FILTER_SHARED: shared}
+
+
+async def _tasks_view_payload(user_id: int, task_filter: str) -> tuple[list, bool, dict] | None:
+    """
+    Общая подготовка данных для show_tasks/tasks_page: полный список +
+    (если есть партнёр) разбивку по вкладкам. Возвращает None, если
+    активных задач вообще нет — вызывающий код должен показать
+    no_active_tasks_text() и остановиться.
+
+    show_filter_tabs=False для пользователей без партнёра — вкладки
+    "Мои"/"Общие" для них ничего бы не значили, список ведёт себя ровно
+    как раньше, без единой лишней кнопки.
+    """
+    tasks = await get_active_tasks_by_deadline(user_id=user_id)
+    if not tasks:
+        return None
+
+    partner = await get_partner(user_id)
+    show_filter_tabs = partner is not None
+    if not show_filter_tabs:
+        return tasks, False, {}
+
+    by_filter = _split_tasks_by_filter(tasks, user_id)
+    counts = {key: len(items) for key, items in by_filter.items()}
+    filtered = by_filter.get(task_filter, tasks)
+    return filtered, True, counts
+
+
+async def show_tasks(message: Message, task_filter: str = TASKS_FILTER_ALL) -> None:
     """
     Общая логика показа списка задач — вызывается и /tasks, и кнопкой.
     Список отсортирован по срочности (get_active_tasks_by_deadline) и уже
@@ -151,16 +192,31 @@ async def show_tasks(message: Message) -> None:
     текущей странице — кликабельная кнопка, открывающая её карточку (см.
     tasks_page_keyboard / card_open); viewer_user_id передаётся дальше,
     чтобы пометить общие задачи значком 👥 и не путать их со своими.
+
+    task_filter — см. _tasks_view_payload/keyboards.TASKS_FILTER_*.
     """
     user_id = message.from_user.id
-    tasks = await get_active_tasks_by_deadline(user_id=user_id)
+    payload = await _tasks_view_payload(user_id, task_filter)
 
-    if not tasks:
+    if payload is None:
         await message.answer(texts.no_active_tasks_text(), reply_markup=main_menu_keyboard)
         return
 
-    keyboard, offset = tasks_page_keyboard(tasks, offset=0, viewer_user_id=user_id)
-    await message.answer(texts.tasks_list_text(tasks, viewer_user_id=user_id), reply_markup=keyboard.as_markup())
+    filtered, show_filter_tabs, counts = payload
+    if not filtered:
+        # Есть активные задачи вообще, но конкретная вкладка (обычно
+        # "Общие") пуста — отдельная реплика вместо пустого списка.
+        await message.answer(texts.no_tasks_in_filter_text(task_filter), reply_markup=main_menu_keyboard)
+        return
+
+    keyboard, offset = tasks_page_keyboard(
+        filtered, offset=0, viewer_user_id=user_id,
+        task_filter=task_filter, show_filter_tabs=show_filter_tabs, filter_counts=counts,
+    )
+    await message.answer(
+        texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=task_filter if show_filter_tabs else None),
+        reply_markup=keyboard.as_markup(),
+    )
 
 
 async def _task_card_extras(task, viewer_user_id: int) -> tuple[bool, bool]:
@@ -170,17 +226,17 @@ async def _task_card_extras(task, viewer_user_id: int) -> tuple[bool, bool]:
     - shared_by_partner — True, если это ЧУЖАЯ общая задача, открытая
       партнёром (не своя) — карточка тогда отмечается плашкой об этом.
     - can_toggle_shared — виден ли переключатель "личная/общая" вообще:
-      только настоящему владельцу задачи, и только пока у него активен
-      Premium (партнёрский режим целиком завязан на подписку, см.
-      database.requests.is_premium_active) — независимо от того,
-      подключён ли партнёр прямо сейчас: можно заранее пометить задачи
-      общими, до самого приглашения.
+      только настоящему владельцу задачи. Пока у него (само) или у его
+      партнёра (см. database.requests.has_effective_premium) активен
+      Premium — виден всегда, в обе стороны. Если Premium истёк (мягкий
+      переход на Free) — кнопка остаётся видна ТОЛЬКО чтобы вернуть уже
+      общую задачу обратно в личные (task.shared уже True); заново
+      пометить что-то общим без действующего Premium будет уже нельзя.
     """
     is_owner = task.user_id == viewer_user_id
     if not is_owner:
         return True, False
-    viewer = await get_user(viewer_user_id)
-    can_toggle_shared = viewer is not None and is_premium_active(viewer)
+    can_toggle_shared = task.shared or await has_effective_premium(viewer_user_id)
     return False, can_toggle_shared
 
 
@@ -231,18 +287,31 @@ async def _offer_sharing_or_finish(callback: CallbackQuery, task) -> None:
     keyboards.sharing_choice_keyboard), либо, если он не нужен, сразу
     завершает мастер финальной карточкой — ровно как раньше.
 
-    Шаг показывается ТОЛЬКО когда у создателя одновременно активен Premium
-    И уже есть привязанный партнёр — для подавляющего большинства
-    пользователей (нет партнёра или нет Premium) поведение не меняется
-    вообще: задача остаётся личной по умолчанию, шаг просто пропускается.
-    Как и решила пользовательница — никаких дополнительных настроек
-    видимости, только явный выбор между "🔒 Личное" и "👥 Партнёру".
+    Шаг показывается ТОЛЬКО когда у создателя (само или через партнёра,
+    см. database.requests.has_effective_premium) активен Premium И уже
+    есть привязанный партнёр — для подавляющего большинства пользователей
+    (нет партнёра или нет Premium) поведение не меняется вообще: задача
+    остаётся личной по умолчанию, шаг просто пропускается. Как и решила
+    пользовательница — никаких дополнительных настроек видимости, только
+    явный выбор между "🔒 Личное" и "👥 Партнёру".
+
+    Если ИИ-парсер уже сам определил задачу как общую по словам в тексте
+    ("нам", "вместе", "партнёру" — см. services/ai_parser.py и
+    _create_task_with_ai) — task.shared здесь уже True, и вопрос просто
+    не дублируем, сразу показываем итог.
     """
     user_id = callback.from_user.id
-    user = await get_user(user_id)
+
+    if task.shared:
+        await _finish_wizard(
+            callback,
+            texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day, shared=True),
+        )
+        return
+
     partner = await get_partner(user_id)
 
-    if not (user and is_premium_active(user) and partner is not None):
+    if not (partner is not None and await has_effective_premium(user_id)):
         await _finish_wizard(callback, texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day))
         return
 
@@ -251,6 +320,23 @@ async def _offer_sharing_or_finish(callback: CallbackQuery, task) -> None:
         texts.sharing_choice_prompt_text(task.title),
         sharing_choice_keyboard(task.task_id).as_markup(),
     )
+
+
+async def _notify_partner_shared(bot, owner_user_id: int, task_title: str) -> None:
+    """
+    Короткий пуш партнёру, когда владелец делает задачу общей — что при
+    создании (share_choice, ИИ-автоопределение в _create_task_with_ai),
+    что позже из карточки (card_toggle_shared). Партнёр и так увидит
+    задачу в своём общем списке при следующем открытии — это просто
+    "не пропусти", отдельным сообщением, без изменения самого списка.
+    """
+    partner = await get_partner(owner_user_id)
+    if partner is None:
+        return
+    try:
+        await bot.send_message(partner.user_id, texts.partner_new_shared_task_text(task_title))
+    except TelegramBadRequest:
+        pass
 
 
 @router.callback_query(F.data.startswith("share_choice:"))
@@ -266,6 +352,8 @@ async def share_choice(callback: CallbackQuery) -> None:
         return
 
     await callback.answer("Готово! 🎉")
+    if task.shared:
+        await _notify_partner_shared(callback.bot, user_id, task.title)
     await _finish_wizard(
         callback,
         texts.deadline_saved_text(task.title, task.priority, task.deadline, task.deadline_all_day, shared=task.shared),
@@ -303,19 +391,37 @@ async def tasks_button(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("tasks_page:"))
 async def tasks_page(callback: CallbackQuery) -> None:
-    """Листание страниц списка "📋 Мои задачи" и кнопка "◀️ Назад к списку" в
-    карточке задачи (она использует этот же callback_data)."""
-    offset = int(callback.data.split(":", maxsplit=1)[1])
+    """Листание страниц списка "📋 Мои задачи", клики по вкладкам-фильтрам
+    "Все/Мои/Общие" и кнопка "◀️ Назад к списку" в карточке задачи — все
+    используют один и тот же callback_data "tasks_page:{offset}:{filter}"
+    (filter опущен → "all", для совместимости со старыми сообщениями,
+    отправленными до появления фильтров)."""
+    parts = callback.data.split(":")
+    offset = int(parts[1])
+    task_filter = parts[2] if len(parts) > 2 else TASKS_FILTER_ALL
     user_id = callback.from_user.id
-    tasks = await get_active_tasks_by_deadline(user_id=user_id)
 
-    if not tasks:
+    payload = await _tasks_view_payload(user_id, task_filter)
+    if payload is None:
         await callback.message.edit_text(texts.no_active_tasks_text())
         await callback.answer()
         return
 
-    keyboard, offset = tasks_page_keyboard(tasks, offset, viewer_user_id=user_id)
-    await callback.message.edit_text(texts.tasks_list_text(tasks, viewer_user_id=user_id), reply_markup=keyboard.as_markup())
+    filtered, show_filter_tabs, counts = payload
+    if not filtered:
+        await callback.message.edit_text(texts.no_tasks_in_filter_text(task_filter))
+        await callback.answer()
+        return
+
+    keyboard, offset = tasks_page_keyboard(
+        filtered, offset, viewer_user_id=user_id,
+        task_filter=task_filter, show_filter_tabs=show_filter_tabs, filter_counts=counts,
+    )
+    await callback.message.edit_text(
+        texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=task_filter if show_filter_tabs else None),
+        reply_markup=keyboard.as_markup(),
+    )
+    await callback.answer()
     await callback.answer()
 
 
@@ -428,6 +534,15 @@ async def complete_task(
 
     if result.leveled_up:
         await callback.message.answer(texts.level_up_text(result.new_level))
+
+    if result.partner_notified is not None:
+        try:
+            await callback.bot.send_message(
+                result.partner_notified,
+                texts.partner_task_done_push_text(result.task_title, result.xp_amount),
+            )
+        except TelegramBadRequest:
+            pass
 
     return result.task_title, result.xp_amount
 
@@ -571,6 +686,18 @@ async def _create_task_with_ai(message: Message, task) -> None:
         return
 
     user_id = task.user_id
+
+    if parsed.is_shared:
+        # ИИ сама услышала "мы"/"нам"/"вместе"/"партнёру" в тексте — но
+        # применяем это только когда партнёрский режим вообще доступен
+        # (Premium — своё или партнёра, см. has_effective_premium — и уже
+        # есть привязанный партнёр); иначе значение просто не имеет смысла
+        # и молча игнорируется, задача остаётся личной как раньше.
+        partner = await get_partner(user_id)
+        if partner is not None and await has_effective_premium(user_id):
+            shared_task = await set_task_shared(task_id=task.task_id, user_id=user_id, shared=True)
+            if shared_task is not None:
+                await _notify_partner_shared(message.bot, user_id, parsed.title or task.title)
 
     if parsed.title and parsed.title != task.title:
         await update_task_title(task_id=task.task_id, user_id=user_id, title=parsed.title)
@@ -1402,6 +1529,8 @@ async def card_toggle_shared(callback: CallbackQuery) -> None:
         return
 
     await callback.answer("Теперь общая с партнёром 👥" if task.shared else "Теперь личная 🔒")
+    if task.shared:
+        await _notify_partner_shared(callback.bot, user_id, task.title)
     reminders = await get_task_reminders(task_id)
     shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
     await callback.message.edit_text(

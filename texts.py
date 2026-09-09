@@ -125,22 +125,27 @@ def _date_ru(moment) -> str:
 date_ru = _date_ru
 
 
-def premium_status_text(is_active: bool, premium_until, price_stars: int, duration_days: int) -> str:
-    """Экран "💎 Premium" — статус подписки + приглашение оформить/продлить."""
+def premium_status_text(is_active: bool, premium_until, price_month_stars: int, price_year_stars: int) -> str:
+    """Экран "💎 Premium" — статус подписки + приглашение оформить/продлить.
+    Партнёр, подключённый по чужой подписке, тоже может открыть этот
+    экран (см. database.requests.has_effective_premium) — is_active для
+    него тоже True, текст при этом одинаковый для обеих сторон пары."""
     if is_active:
         return (
             "💎 <b>Premium активен</b>\n"
             f"Действует до {_date_ru(premium_until)}.\n\n"
             "Открыт партнёрский режим — общие задачи для двоих 👥\n\n"
-            f"Продлить ещё на {duration_days} дней можно в любой момент — "
-            f"дни добавятся к уже оплаченному сроку, а не сгорят."
+            "Продлить можно в любой момент — дни добавятся к уже "
+            "оплаченному сроку, а не сгорят."
         )
     return (
         "💎 <b>Thomas Koszaczy Premium</b>\n\n"
         "Что открывает Premium:\n"
-        "👥 Партнёрский режим — общее пространство задач для двоих\n"
+        "👥 Партнёрский режим — общее пространство задач для двоих "
+        "(партнёр подключается по ссылке бесплатно, платит только один)\n"
         "✨ Все будущие Premium-фичи автоматически\n\n"
-        f"Стоимость: {price_stars} ⭐ Stars / {duration_days} дней.\n"
+        f"Месяц — {price_month_stars} ⭐\n"
+        f"Год — {price_year_stars} ⭐ (выгоднее почти на 35%)\n\n"
         "Оплата — прямо здесь, в Telegram, звёздами. Карты и банковские "
         "данные боту не нужны и не видны."
     )
@@ -252,6 +257,19 @@ def partner_unlinked_by_other_text(other) -> str:
     """Уведомление ВТОРОЙ стороне, когда пару разорвал не он сам (см.
     handlers/partner.py::partner_unlink_yes)."""
     return f"🔓 {_partner_display(other)} отвязал(а) партнёрский доступ — общие задачи больше не видны друг другу."
+
+
+def partner_new_shared_task_text(task_title: str) -> str:
+    """Пуш партнёру, когда владелец делает задачу общей — при создании
+    (ИИ сама определила по словам в тексте, или явный выбор "👥 Партнёру")
+    либо позже из карточки (см. handlers/tasks.py::_notify_partner_shared)."""
+    return f"🐾 Партнёр добавил(а) общую задачу: «{escape(task_title)}» — уже в твоём списке!"
+
+
+def partner_task_done_push_text(task_title: str, xp_amount: int) -> str:
+    """Пуш партнёру, когда общую задачу закрыл ОН, а не сам получатель —
+    XP при этом начисляется обоим (см. services/task_actions.py)."""
+    return f"🐾 Партнёр закрыл(а) общую задачу «{escape(task_title)}» — тебе тоже +{xp_amount} XP ✨"
 
 
 def welcome_text() -> str:
@@ -390,16 +408,35 @@ def _list_bullet_line(task, viewer_user_id: int | None = None) -> str:
     return f"• {partner_marker}<b>{escape(task.title)}</b>{_list_bullet_detail(task)} {PRIORITY_MARKERS[task.priority]}"
 
 
-def tasks_list_text(tasks: list, viewer_user_id: int | None = None) -> str:
+_TASKS_FILTER_TITLES = {
+    "mine": "👤 <b>ТВОИ ЛИЧНЫЕ ЗАДАЧИ</b>",
+    "shared": "👥 <b>ОБЩИЕ ЗАДАЧИ</b>",
+}
+
+
+def no_tasks_in_filter_text(task_filter: str) -> str:
+    """Пустая вкладка фильтра списка задач (обычно "Общие", пока ничего не
+    сделано общим) — отдельно от no_active_tasks_text(), т.к. активные
+    задачи вообще-то есть, просто не в этой вкладке."""
+    if task_filter == "shared":
+        return "👥 Общих задач пока нет — отметь что-нибудь общим прямо в карточке задачи."
+    return "👤 Личных задач пока нет — все текущие уже общие с партнёром."
+
+
+def tasks_list_text(tasks: list, viewer_user_id: int | None = None, task_filter: str | None = None) -> str:
     """
     Список задач как компактный дашборд с группировкой по срочности (см.
     task_urgency_category): 🔥 горят сегодня → ⏳ ближайшие → 🌱 бэклог,
-    внутри каждой группы — строка-буллет на задачу. tasks — ПОЛНЫЙ список
-    активных задач (не только текущая страница) — в отличие от инлайн-
-    кнопок под сообщением (см. keyboards.tasks_page_keyboard), которые
-    показывают только одну страницу, текст всегда даёт целостную картину.
+    внутри каждой группы — строка-буллет на задачу. tasks — уже
+    ОТФИЛЬТРОВАННЫЙ (если task_filter задан) список активных задач (не
+    только текущая страница) — в отличие от инлайн-кнопок под сообщением
+    (см. keyboards.tasks_page_keyboard), которые показывают только одну
+    страницу, текст всегда даёт целостную картину по текущей вкладке.
 
     viewer_user_id — см. _list_bullet_line (маркер 👥 у общих задач партнёра).
+    task_filter — "mine"/"shared" меняют заголовок под текущую вкладку
+    (см. keyboards.TASKS_FILTER_*); None или "all" — обычный заголовок,
+    как было раньше для всех, у кого нет партнёра.
     """
     if not tasks:
         return no_active_tasks_text()
@@ -408,7 +445,8 @@ def tasks_list_text(tasks: list, viewer_user_id: int | None = None) -> str:
     for task in tasks:
         grouped[task_urgency_category(task)].append(task)
 
-    blocks = ["📋 <b>ТВОИ ЗАДАЧИ</b>", _DIVIDER]
+    title = _TASKS_FILTER_TITLES.get(task_filter, "📋 <b>ТВОИ ЗАДАЧИ</b>")
+    blocks = [title, _DIVIDER]
     for category in (0, 1, 2):
         group_tasks = grouped[category]
         if not group_tasks:
@@ -868,9 +906,10 @@ def morning_checklist_text(tasks: list) -> str:
     return "\n".join(lines)
 
 
-def notifications_entry_text() -> str:
-    """Короткая подсказка под карточкой профиля, ведущая на экран 🔔 Уведомления."""
-    return "🔔 Хочешь настроить уведомления — тихие часы, напоминания по задачам, утренний чек-лист?"
+def profile_actions_text() -> str:
+    """Короткая подсказка под карточкой профиля — ведёт на три инлайн-кнопки
+    (см. keyboards.profile_actions_keyboard): партнёр, уведомления, подписка."""
+    return "⚙️ Ещё немного настроек:"
 
 
 def notifications_settings_text() -> str:

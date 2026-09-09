@@ -53,6 +53,13 @@ class ParsedTask:
     deadline: datetime | None
     all_day: bool
     priority: Priority | None
+    # True, если в тексте явно звучит "мы"/"нам"/"вместе"/"партнёру" и т.п.
+    # (см. _system_prompt) — вызывающий код (handlers/tasks.py::
+    # _create_task_with_ai) применяет это ТОЛЬКО если у автора уже есть
+    # Premium и привязанный партнёр, иначе поле просто игнорируется, как
+    # будто его не было: партнёрский режим в самом ai_parser не проверяем
+    # намеренно, это забота вызывающего кода, а не разбора текста.
+    is_shared: bool
 
 
 def _system_prompt(now: datetime) -> str:
@@ -75,6 +82,11 @@ def _system_prompt(now: datetime) -> str:
         "срочность явно названа словами (\"срочно\", \"важно\", \"не "
         "горит\", \"когда-нибудь\"), иначе null — не угадывай важность по "
         "смыслу дела.\n"
+        '  "is_shared": true, ТОЛЬКО если в сообщении явно звучат слова '
+        "про двоих — \"мы\", \"нам\", \"вместе\", \"партнёру\", \"нам с "
+        "партнёром\", \"общая задача\" — иначе false. Не угадывай по смыслу "
+        "дела (\"купить корм котам\" — это НЕ автоматически общее, только "
+        "если так и сказано словами).\n"
         "}\n\n"
         "Относительные даты (\"завтра\", \"в пятницу\", \"через 2 часа\") "
         "переводи в абсолютную дату относительно текущего момента выше."
@@ -136,8 +148,9 @@ async def parse_task_message(text: str) -> ParsedTask | None:
 
         all_day = bool(parsed.get("all_day")) and deadline is not None
         priority = _PRIORITY_BY_CODE.get(parsed.get("priority"))
+        is_shared = bool(parsed.get("is_shared"))
 
-        return ParsedTask(title=title, deadline=deadline, all_day=all_day, priority=priority)
+        return ParsedTask(title=title, deadline=deadline, all_day=all_day, priority=priority, is_shared=is_shared)
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
         logger.exception("Не удалось разобрать ответ DeepSeek: %r", data)
         return None

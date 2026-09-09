@@ -30,51 +30,75 @@ from keyboards import PREMIUM_BUTTON_TEXT, premium_buy_keyboard
 
 router = Router(name="subscription")
 
-# Цена и срок подписки — единственное место, где их нужно менять, если
-# решим пересчитать тариф.
-PREMIUM_PRICE_STARS = 199
-PREMIUM_DURATION_DAYS = 30
+# Два периода оплаты — единственное место, где их нужно менять, если
+# решим пересчитать тариф. Год посчитан с выгодой ~35% относительно
+# 12 отдельных месячных платежей (12 × 249 = 2988⭐ vs 1990⭐).
+PREMIUM_PRICE_STARS_MONTH = 249
+PREMIUM_DURATION_DAYS_MONTH = 30
+PREMIUM_PRICE_STARS_YEAR = 1990
+PREMIUM_DURATION_DAYS_YEAR = 365
 
-# Свой идентификатор счёта — sверяем его же в pre_checkout_query, просто
-# чтобы не подтверждать вслепую платёж с чужим/неожиданным payload.
-_INVOICE_PAYLOAD = "premium_30d"
+_PERIODS = {
+    "month": (PREMIUM_PRICE_STARS_MONTH, PREMIUM_DURATION_DAYS_MONTH, "месяц"),
+    "year": (PREMIUM_PRICE_STARS_YEAR, PREMIUM_DURATION_DAYS_YEAR, "год"),
+}
+
+# Свой идентификатор счёта на каждый период — сверяем его же в
+# pre_checkout_query, просто чтобы не подтверждать вслепую платёж с
+# чужим/неожиданным payload.
+_INVOICE_PAYLOAD_PREFIX = "premium_"
 
 
-async def show_premium_screen(message: Message) -> None:
-    user = await get_or_create_user(user_id=message.from_user.id, username=message.from_user.username)
+async def show_premium_screen(message: Message, user_id: int, username: str | None = None) -> None:
+    """
+    message — куда отправить ответ (может быть чужим исходящим сообщением,
+    если экран открыт инлайн-кнопкой с другого экрана, см.
+    handlers/partner.py::partner_go_premium и handlers/profile.py::
+    profile_premium) — а вот user_id/username ВСЕГДА берём отдельно, у
+    настоящего кликнувшего человека, а не у message.from_user (для
+    исходящего сообщения бота это был бы сам бот, а не человек).
+    """
+    user = await get_or_create_user(user_id=user_id, username=username)
     active = is_premium_active(user)
     await message.answer(
-        texts.premium_status_text(active, user.premium_until, PREMIUM_PRICE_STARS, PREMIUM_DURATION_DAYS),
+        texts.premium_status_text(active, user.premium_until, PREMIUM_PRICE_STARS_MONTH, PREMIUM_PRICE_STARS_YEAR),
         reply_markup=premium_buy_keyboard(active).as_markup(),
     )
 
 
 @router.message(F.text == PREMIUM_BUTTON_TEXT)
 async def premium_button(message: Message) -> None:
-    await show_premium_screen(message)
+    await show_premium_screen(message, message.from_user.id, message.from_user.username)
 
 
 @router.message(Command("premium"))
 async def cmd_premium(message: Message) -> None:
-    await show_premium_screen(message)
+    await show_premium_screen(message, message.from_user.id, message.from_user.username)
 
 
-@router.callback_query(F.data == "premium_buy")
+@router.callback_query(F.data.startswith("premium_buy:"))
 async def premium_buy(callback: CallbackQuery) -> None:
+    period = callback.data.split(":", maxsplit=1)[1]
+    if period not in _PERIODS:
+        await callback.answer()
+        return
+    price, days, label_ru = _PERIODS[period]
+
     await callback.answer()
     await callback.message.answer_invoice(
         title="Thomas Koszaczy Premium",
-        description=f"Партнёрский режим и будущие Premium-фичи на {PREMIUM_DURATION_DAYS} дней.",
-        payload=_INVOICE_PAYLOAD,
+        description=f"Партнёрский режим и все Premium-фичи на {days} дней.",
+        payload=f"{_INVOICE_PAYLOAD_PREFIX}{period}",
         provider_token="",
         currency="XTR",
-        prices=[LabeledPrice(label=f"Premium на {PREMIUM_DURATION_DAYS} дней", amount=PREMIUM_PRICE_STARS)],
+        prices=[LabeledPrice(label=f"Premium на {label_ru}", amount=price)],
     )
 
 
 @router.pre_checkout_query()
 async def precheckout(pre_checkout_query: PreCheckoutQuery) -> None:
-    if pre_checkout_query.invoice_payload != _INVOICE_PAYLOAD:
+    period = pre_checkout_query.invoice_payload.removeprefix(_INVOICE_PAYLOAD_PREFIX)
+    if period not in _PERIODS:
         await pre_checkout_query.answer(
             ok=False, error_message="Что-то пошло не так со счётом — попробуй ещё раз через /premium."
         )
@@ -84,5 +108,7 @@ async def precheckout(pre_checkout_query: PreCheckoutQuery) -> None:
 
 @router.message(F.successful_payment)
 async def successful_payment(message: Message) -> None:
-    new_until = await extend_premium(user_id=message.from_user.id, days=PREMIUM_DURATION_DAYS)
+    period = message.successful_payment.invoice_payload.removeprefix(_INVOICE_PAYLOAD_PREFIX)
+    _, days, _ = _PERIODS.get(period, (None, PREMIUM_DURATION_DAYS_MONTH, None))
+    new_until = await extend_premium(user_id=message.from_user.id, days=days)
     await message.answer(texts.premium_purchased_text(new_until))

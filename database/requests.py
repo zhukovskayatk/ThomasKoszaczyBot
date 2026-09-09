@@ -374,6 +374,38 @@ async def get_partner(user_id: int) -> User | None:
         return result.scalar_one_or_none()
 
 
+async def has_effective_premium(user_id: int) -> bool:
+    """
+    Как is_premium_active, но дополнительно учитывает партнёра: платит за
+    Premium только один из пары (см. handlers/subscription.py), но самим
+    партнёрским режимом и его платными плюшками (лимиты на личные задачи/
+    привычки, экспорт в календарь, магазин купонов и т.д.) должны
+    одинаково пользоваться ОБА — значит, и проверять доступ к ним нужно по
+    этой функции, а не по is_premium_active (та знает только про самого
+    user_id и годится для админских команд и логики самой оплаты).
+
+    Если оплативший не продлит подписку — оба тихо возвращаются на Free
+    (мягкий переход): уже созданные общие задачи никуда не пропадают (см.
+    get_active_tasks — она вообще не смотрит на Premium), а вот пометить
+    что-то общим ЗАНОВО уже не выйдет, потому что can_toggle_shared и
+    _offer_sharing_or_finish в handlers/tasks.py тоже сверяются по этой
+    функции.
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return False
+        if is_premium_active(user):
+            return True
+        if user.family_id is None:
+            return False
+        result = await session.execute(
+            select(User).where(User.family_id == user.family_id, User.user_id != user_id)
+        )
+        partner = result.scalar_one_or_none()
+        return partner is not None and is_premium_active(partner)
+
+
 async def create_partner_invite(user_id: int) -> str:
     """
     Выпускает новый код приглашения для диплинка (кнопка "🔗 Получить

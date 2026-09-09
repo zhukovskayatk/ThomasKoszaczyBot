@@ -35,7 +35,7 @@ from keyboards import (
     PROFILE_BUTTON_TEXT,
     main_menu_keyboard,
     notification_settings_keyboard,
-    notifications_entry_keyboard,
+    profile_actions_keyboard,
     streak_rescue_keyboard,
 )
 from services.leveling import get_level_info
@@ -86,14 +86,14 @@ async def show_profile(message: Message) -> None:
         # под карточкой, чтобы не перегружать саму карточку профиля.
         await message.answer(texts.streak_reset_text())
 
-    # Короткая подсказка-кнопка на экран "🔔 Уведомления" — отдельным
-    # сообщением, т.к. у карточки профиля уже занят reply_markup под
-    # постоянную клавиатуру (main_menu_keyboard), а инлайн-кнопка на неё
-    # "поверх" не помещается — Telegram допускает только один reply_markup
-    # на сообщение.
+    # Три инлайн-кнопки отдельным сообщением — т.к. у карточки профиля уже
+    # занят reply_markup под постоянную клавиатуру (main_menu_keyboard), а
+    # инлайн-кнопки на неё "поверх" не помещаются — Telegram допускает
+    # только один reply_markup на сообщение. Сюда же переехали 💎 Premium
+    # и 👥 Партнёр из нижнего меню (см. keyboards.profile_actions_keyboard).
     await message.answer(
-        texts.notifications_entry_text(),
-        reply_markup=notifications_entry_keyboard().as_markup(),
+        texts.profile_actions_text(),
+        reply_markup=profile_actions_keyboard().as_markup(),
     )
 
 
@@ -105,6 +105,26 @@ async def cmd_profile(message: Message) -> None:
 @router.message(F.text.in_({PROFILE_BUTTON_TEXT, *LEGACY_PROFILE_BUTTON_TEXTS}))
 async def profile_button(message: Message) -> None:
     await show_profile(message)
+
+
+@router.callback_query(F.data == "profile_partner")
+async def profile_partner(callback: CallbackQuery) -> None:
+    """"👥 Мой партнёр" под карточкой профиля — тот же экран, что раньше
+    открывался отдельной кнопкой в нижнем меню (см. handlers/partner.py)."""
+    from handlers import partner  # локальный импорт — без цикла (partner не знает про profile)
+
+    await callback.answer()
+    await partner.show_partner_screen(callback.message, callback.from_user.id)
+
+
+@router.callback_query(F.data == "profile_premium")
+async def profile_premium(callback: CallbackQuery) -> None:
+    """"💎 Подписка" под карточкой профиля — тот же экран, что раньше
+    открывался отдельной кнопкой в нижнем меню (см. handlers/subscription.py)."""
+    from handlers import subscription  # локальный импорт — без цикла
+
+    await callback.answer()
+    await subscription.show_premium_screen(callback.message, callback.from_user.id, callback.from_user.username)
 
 
 @router.callback_query(F.data == "streak_rescue")
