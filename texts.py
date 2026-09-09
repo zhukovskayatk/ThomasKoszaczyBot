@@ -126,10 +126,12 @@ date_ru = _date_ru
 
 
 def premium_status_text(is_active: bool, premium_until, price_month_stars: int, price_year_stars: int) -> str:
-    """Экран "💎 Premium" — статус подписки + приглашение оформить/продлить.
-    Партнёр, подключённый по чужой подписке, тоже может открыть этот
-    экран (см. database.requests.has_effective_premium) — is_active для
-    него тоже True, текст при этом одинаковый для обеих сторон пары."""
+    """Экран "💎 Premium" для СВОЕЙ (оплаченной самим человеком) подписки —
+    статус + приглашение оформить/продлить. Для партнёра, у которого нет
+    своей подписки, но есть полный доступ по чужой (см.
+    database.requests.has_effective_premium) — отдельный текст, см.
+    premium_inherited_status_text ниже: показывать ему кнопки "оформить/
+    продлить" не нужно, покупать ему нечего."""
     if is_active:
         return (
             "💎 <b>Premium активен</b>\n"
@@ -148,6 +150,26 @@ def premium_status_text(is_active: bool, premium_until, price_month_stars: int, 
         f"Год — {price_year_stars} ⭐ (выгоднее почти на 35%)\n\n"
         "Оплата — прямо здесь, в Telegram, звёздами. Карты и банковские "
         "данные боту не нужны и не видны."
+    )
+
+
+def premium_inherited_status_text(partner, premium_until) -> str:
+    """
+    Экран "💎 Premium" для партнёра, который сам не платил, но пользуется
+    ПОЛНЫМ доступом благодаря активной подписке платящего (см.
+    database.requests.has_effective_premium) — намеренно без урезаний:
+    общие задачи, все Premium-фичи наравне с платившим. Кнопок "оформить/
+    продлить" здесь нет (см. handlers/subscription.py::show_premium_screen)
+    — ему просто нечего покупать, пока подписка партнёра активна.
+    """
+    return (
+        "💎 <b>Premium активен — по подписке партнёра</b>\n"
+        f"{_partner_display(partner)} оплатил(а) подписку, действует до "
+        f"{_date_ru(premium_until)}.\n\n"
+        "Пока она активна, тебе открыт точно такой же полный доступ — без "
+        "ограничений и урезаний, включая все Premium-фичи.\n\n"
+        "Если подписка партнёра закончится, вы оба мягко вернётесь на "
+        "бесплатный тариф — уже созданные общие задачи никуда не денутся."
     )
 
 
@@ -425,35 +447,56 @@ def no_tasks_in_filter_text(task_filter: str) -> str:
 
 def tasks_list_text(tasks: list, viewer_user_id: int | None = None, task_filter: str | None = None) -> str:
     """
-    Список задач как компактный дашборд с группировкой по срочности (см.
-    task_urgency_category): 🔥 горят сегодня → ⏳ ближайшие → 🌱 бэклог,
-    внутри каждой группы — строка-буллет на задачу. tasks — уже
-    ОТФИЛЬТРОВАННЫЙ (если task_filter задан) список активных задач (не
-    только текущая страница) — в отличие от инлайн-кнопок под сообщением
-    (см. keyboards.tasks_page_keyboard), которые показывают только одну
+    Список задач как компактный дашборд. tasks — уже ОТФИЛЬТРОВАННЫЙ (если
+    task_filter задан) список активных задач (не только текущая страница) —
+    в отличие от инлайн-кнопок под сообщением (см.
+    keyboards.tasks_page_keyboard), которые показывают только одну
     страницу, текст всегда даёт целостную картину по текущей вкладке.
+
+    Два варианта группировки внутри:
+    - вкладка "all" у пары (виден и свой, и партнёрский список сразу) —
+      делим на "👤 Мои дела" и "🔥 Ближайшие общие дела" по ВЛАДЕЛЬЦУ, а не
+      по срочности: смешанный список без разделения по человеку — то,
+      из-за чего общие дела партнёра терялись между своими, отсюда и
+      просьба разделить наглядно (см. task_filter == "all" ниже).
+    - все остальные случаи (нет партнёра, либо уже отфильтровано на вкладке
+      "Мои"/"Общие" — там и так один владелец) — старая группировка по
+      срочности (см. task_urgency_category): 🔥 горят сегодня → ⏳
+      ближайшие → 🌱 бэклог.
 
     viewer_user_id — см. _list_bullet_line (маркер 👥 у общих задач партнёра).
     task_filter — "mine"/"shared" меняют заголовок под текущую вкладку
-    (см. keyboards.TASKS_FILTER_*); None или "all" — обычный заголовок,
-    как было раньше для всех, у кого нет партнёра.
+    (см. keyboards.TASKS_FILTER_*); None — обычный заголовок, как было
+    раньше для всех, у кого нет партнёра.
     """
     if not tasks:
         return no_active_tasks_text()
 
-    grouped: dict[int, list] = {0: [], 1: [], 2: []}
-    for task in tasks:
-        grouped[task_urgency_category(task)].append(task)
-
     title = _TASKS_FILTER_TITLES.get(task_filter, "📋 <b>ТВОИ ЗАДАЧИ</b>")
     blocks = [title, _DIVIDER]
-    for category in (0, 1, 2):
-        group_tasks = grouped[category]
-        if not group_tasks:
-            continue
-        blocks.append(f"{URGENCY_MARKERS[category]} <b>{_GROUP_TITLES[category]}:</b>")
-        blocks.extend(_list_bullet_line(task, viewer_user_id) for task in group_tasks)
-        blocks.append("")
+
+    if task_filter == "all" and viewer_user_id is not None:
+        mine = [t for t in tasks if t.user_id == viewer_user_id and not t.shared]
+        shared = [t for t in tasks if t.shared]
+        if mine:
+            blocks.append("👤 <b>Мои дела:</b>")
+            blocks.extend(_list_bullet_line(task, viewer_user_id) for task in mine)
+            blocks.append("")
+        if shared:
+            blocks.append("🔥 <b>Ближайшие общие дела:</b>")
+            blocks.extend(_list_bullet_line(task, viewer_user_id) for task in shared)
+            blocks.append("")
+    else:
+        grouped: dict[int, list] = {0: [], 1: [], 2: []}
+        for task in tasks:
+            grouped[task_urgency_category(task)].append(task)
+        for category in (0, 1, 2):
+            group_tasks = grouped[category]
+            if not group_tasks:
+                continue
+            blocks.append(f"{URGENCY_MARKERS[category]} <b>{_GROUP_TITLES[category]}:</b>")
+            blocks.extend(_list_bullet_line(task, viewer_user_id) for task in group_tasks)
+            blocks.append("")
 
     if blocks[-1] == "":
         blocks.pop()

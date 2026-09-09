@@ -25,7 +25,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, LabeledPrice, Message, PreCheckoutQuery
 
 import texts
-from database.requests import extend_premium, get_or_create_user, is_premium_active
+from database.requests import extend_premium, get_or_create_user, get_partner, is_premium_active
 from keyboards import PREMIUM_BUTTON_TEXT, premium_buy_keyboard
 
 router = Router(name="subscription")
@@ -60,6 +60,19 @@ async def show_premium_screen(message: Message, user_id: int, username: str | No
     """
     user = await get_or_create_user(user_id=user_id, username=username)
     active = is_premium_active(user)
+
+    if not active:
+        # Своей подписки нет — но если пара уже есть и партнёр её оплатил,
+        # у этого человека ДОЛЖЕН быть точно такой же полный доступ, без
+        # намёка на "оформи свою" (см. database.requests.has_effective_premium
+        # и texts.premium_inherited_status_text — экономика лишнего места в
+        # подписке партнёра копеечная, а вот половинчатый доступ ломает саму
+        # идею партнёрского режима).
+        partner = await get_partner(user_id)
+        if partner is not None and is_premium_active(partner):
+            await message.answer(texts.premium_inherited_status_text(partner, partner.premium_until))
+            return
+
     await message.answer(
         texts.premium_status_text(active, user.premium_until, PREMIUM_PRICE_STARS_MONTH, PREMIUM_PRICE_STARS_YEAR),
         reply_markup=premium_buy_keyboard(active).as_markup(),
