@@ -405,20 +405,39 @@ async def _render_shprmd_screen(callback: CallbackQuery, toast: str | None = Non
 @router.callback_query(F.data == "shprmd_open")
 async def shprmd_open(callback: CallbackQuery) -> None:
     """"🛒 Напоминание о покупках" в "🔔 Уведомления" — новая, по умолчанию
-    выключенная еженедельная фича: карусель "Выкл · Пн · ... · Вс" +
-    степпер времени (см. keyboards.shopping_reminder_screen_keyboard)."""
+    выключенная еженедельная фича: сетка 4×2 кнопок дней недели + "❌ Выкл"
+    + степпер времени (см. keyboards.shopping_reminder_screen_keyboard)."""
     await _render_shprmd_screen(callback)
+
+
+@router.callback_query(F.data.startswith("shpick:"))
+async def shprmd_pick(callback: CallbackQuery) -> None:
+    """
+    Тап по одной из 8 кнопок сетки дней (см.
+    keyboards.SHOPPING_DAY_GRID_LABELS/shopping_reminder_screen_keyboard) —
+    "shpick:0".."shpick:6" сразу включает напоминание на этот день недели,
+    "shpick:off" — выключает. Один тап = мгновенный результат, без
+    промежуточных состояний, как и везде в боте (см.
+    database.requests.set_shopping_reminder_schedule).
+    """
+    value = callback.data.split(":", maxsplit=1)[1]
+    if value == "off":
+        await set_shopping_reminder_schedule(callback.from_user.id, False, 0)
+    else:
+        await set_shopping_reminder_schedule(callback.from_user.id, True, int(value))
+    await _render_shprmd_screen(callback, "Обновлено ✅")
 
 
 @router.callback_query(F.data.startswith("shcycle:"))
 async def shprmd_cycle(callback: CallbackQuery) -> None:
     """
-    ◀️/▶️ на экране "🛒 Напоминание о покупках" — листает ОБЩУЮ карусель
-    "Выкл · Пн · Вт · ... · Вс" (см. keyboards.SHOPPING_CYCLE_LABELS): один
-    тап одновременно меняет и включённость, и (если это день) день
-    недели, так что отдельного тумблера ☑️/◻️ на этом экране больше нет —
-    "Выкл" тут такое же полноправное значение карусели, как и любой день
-    (см. database.requests.set_shopping_reminder_schedule).
+    Оставлен ради обратной совместимости со СТАРЫМ экраном-каруселью
+    ("Выкл · Пн · ... · Вс" в одной кнопке, см. keyboards.SHOPPING_CYCLE_LABELS) —
+    у неё оказался баг: на реальном телефоне длинная склеенная строка
+    обрезалась. Новый экран (см. shprmd_pick выше) использует отдельные
+    кнопки дней вместо ◀️/▶️-карусели, но если у кого-то ещё открыто старое
+    сообщение с прежней клавиатурой — клик по ◀️/▶️ там должен продолжать
+    работать.
     """
     delta = int(callback.data.split(":", maxsplit=1)[1])
     user = await get_or_create_user(user_id=callback.from_user.id, username=callback.from_user.username)

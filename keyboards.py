@@ -244,6 +244,38 @@ def quick_close_session_keyboard(
     return builder
 
 
+# Telegram ВСЕГДА центрирует текст внутри инлайн-кнопки — у Bot API просто
+# нет свойства "выравнивание", это чистое ограничение клиента, и никаким
+# HTML/markdown в тексте КНОПКИ это не обойти (в отличие от текста обычного
+# сообщения, где HTML-разметка работает). Пока каждая задача — отдельная
+# кнопка на всю ширину экрана (по одной в ряд, см. tasks_page_keyboard), а
+# названия разной длины, центрирование каждой строки "гуляет" от кнопки к
+# кнопке — это и есть то самое "текст скачет туда-сюда, глаз дёргается" из
+# жалобы пользователя.
+#
+# Рабочий обход: дополнять текст КАЖДОЙ кнопки до одной и той же общей
+# длины символом, который выглядит как пробел, но пробелом (Unicode Zs) НЕ
+# является — "⠀" (BRAILLE PATTERN BLANK). Обычные пробелы в конце
+# некоторые клиенты Telegram молча обрезают перед отрисовкой кнопки, а этот
+# символ — нет. Одинаковая ИТОГОВАЯ длина строки → одинаковая позиция
+# центра → все строки начинаются примерно в одном месте, что на глаз
+# читается как выравнивание по левому краю, хотя технически Telegram
+# по-прежнему центрирует (уже дополненную) строку. Не идеально пиксель-в-
+# пиксель (у эмодзи и кириллицы разная ширина глифа), но реальный "скачок"
+# длины убирает.
+_BUTTON_PAD_CHAR = "⠀"
+_BUTTON_PAD_TARGET_LEN = 46
+
+
+def _pad_button_left(text: str) -> str:
+    """См. комментарий выше про _BUTTON_PAD_CHAR — дополняет текст кнопки
+    невидимыми символами справа, чтобы центрирование Telegram выглядело как
+    выравнивание по левому краю. Если текст и так длиннее цели — не трогаем."""
+    if len(text) >= _BUTTON_PAD_TARGET_LEN:
+        return text
+    return text + _BUTTON_PAD_CHAR * (_BUTTON_PAD_TARGET_LEN - len(text))
+
+
 def _task_button_label(task, viewer_user_id: int | None = None) -> str:
     """
     Текст кнопки одной задачи в списке "📋 Мои задачи": иконка СРОЧНОСТИ
@@ -256,6 +288,9 @@ def _task_button_label(task, viewer_user_id: int | None = None) -> str:
     Если задача принадлежит не viewer_user_id, а его партнёру (общая
     задача, партнёрский режим, Premium — см. database.requests.get_active_tasks),
     перед названием добавляется значок 👥, чтобы не путать "моё" и "общее".
+
+    Текст дополняется через _pad_button_left — см. комментарий там же про
+    центрирование кнопок в Telegram.
     """
     marker = URGENCY_MARKERS.get(task_urgency_category(task), "")
     partner_marker = "👥 " if (viewer_user_id is not None and task.user_id != viewer_user_id) else ""
@@ -265,8 +300,8 @@ def _task_button_label(task, viewer_user_id: int | None = None) -> str:
     )
     suffix = button_deadline_suffix(task)
     if suffix:
-        return f"{marker} {partner_marker}{short_title} · {suffix}"
-    return f"{marker} {partner_marker}{short_title}"
+        return _pad_button_left(f"{marker} {partner_marker}{short_title} · {suffix}")
+    return _pad_button_left(f"{marker} {partner_marker}{short_title}")
 
 
 def _purchase_button_label(task, viewer_user_id: int | None = None) -> str:
@@ -275,14 +310,14 @@ def _purchase_button_label(task, viewer_user_id: int | None = None) -> str:
     ▫️ вместо иконки срочности (см. _task_button_label): дедлайн/приоритет
     для товара обычно не имеют значения, а тап по строке сразу отмечает
     покупку купленной (см. handlers/tasks.py::buy_toggle), а не открывает
-    карточку задачи.
+    карточку задачи. Тоже дополняется через _pad_button_left.
     """
     partner_marker = "👥 " if (viewer_user_id is not None and task.user_id != viewer_user_id) else ""
     short_title = (
         task.title if len(task.title) <= _TASK_BUTTON_TITLE_LIMIT
         else task.title[:_TASK_BUTTON_TITLE_LIMIT - 1] + "…"
     )
-    return f"▫️ {partner_marker}{short_title}"
+    return _pad_button_left(f"▫️ {partner_marker}{short_title}")
 
 
 # Вкладки-фильтры над списком "📋 Мои задачи" (см. tasks_page_keyboard) —
@@ -1065,13 +1100,20 @@ def quiet_hours_screen_keyboard(enabled: bool, start_minutes: int, end_minutes: 
     return builder
 
 
-# Карусель "Выкл · Пн · Вт · Ср · Чт · Пт · Сб · Вс" для "🛒 Напоминание о
-# покупках" (см. shopping_reminder_screen_keyboard ниже) — индекс 0 значит
-# "выключено", 1..7 — понедельник..воскресенье (индекс-1 = datetime.weekday()).
-# "Выкл" — такое же полноправное значение карусели, как и любой день,
-# поэтому отдельного тумблера ☑️/◻️ на этом экране больше нет: один тап по
-# ◀️/▶️ сразу меняет и включённость, и (если это день) день недели —
-# см. handlers/profile.py::shprmd_cycle/database.requests.set_shopping_reminder_schedule.
+# Раньше здесь была карусель "Выкл · Пн · ... · Вс" в ОДНОЙ кнопке,
+# листаемая ◀️/▶️ (SHOPPING_CYCLE_LABELS/shopping_cycle_state/
+# shopping_cycle_from_state) — на реальном телефоне все 8 подписей,
+# склеенные в одну строку, обрезались ("[Выкл] · Пн ·..." — жалоба
+# пользователя со скриншотом). Сама карусельная арифметика (см. ниже)
+# по-прежнему нужна для СТАРОГО callback'а "shcycle:" (см.
+# handlers/profile.py::shprmd_cycle — оставлен ради обратной совместимости
+# с уже открытыми у кого-то сообщениями), но НОВЫЙ экран (см.
+# shopping_reminder_screen_keyboard ниже) её для отрисовки больше не
+# использует — вместо неё сразу 8 отдельных, коротко подписанных,
+# кликабельных кнопок (SHOPPING_DAY_GRID_LABELS), по макету пользователя:
+# два ряда по 4 — Пн/Вт/Ср/Чт и Пт/Сб/Вс/❌ Выкл, тап сразу фиксирует
+# выбор (см. handlers/profile.py::shprmd_pick), без всякого
+# ◀️/▶️-пролистывания.
 SHOPPING_CYCLE_LABELS = ["Выкл", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
@@ -1088,30 +1130,41 @@ def shopping_cycle_from_state(state: int) -> tuple[bool, int]:
     return True, state - 1
 
 
+# Подписи дней недели для сетки 4×2 (см. shopping_reminder_screen_keyboard
+# ниже) — те же короткие "Пн"..."Вс", что и везде в боте (weekday_short_label),
+# плюс "❌ Выкл" восьмой кнопкой сетки — по преферированному варианту
+# макета пользователя ("Или еще проще — вынести выбор дня в две строчки
+# инлайн-клавиатуры... пользователь просто жмет на нужный день, и он сразу
+# фиксируется, без всяких кривых скроллов текстом внутри кнопки").
+SHOPPING_DAY_GRID_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
 def shopping_reminder_screen_keyboard(enabled: bool, weekday: int, time_minutes: int) -> InlineKeyboardBuilder:
     """
     Экран "🛒 Напоминание о покупках" (см. handlers/profile.py::
-    shprmd_open/shprmd_cycle/shprmd_adjust) — одна строка ◀️/▶️,
-    листающая карусель "Выкл · Пн · ... · Вс" (см. SHOPPING_CYCLE_LABELS
-    выше, текущее значение — в квадратных скобках), плюс степпер времени
-    (см. _time_stepper_rows). Новая, по умолчанию выключенная фича — см.
-    User.shopping_reminder_enabled/shopping_reminder_weekday/
-    shopping_reminder_time_minutes.
+    shprmd_open/shprmd_pick/shprmd_adjust) — сетка 4×2 из отдельных
+    кликабельных кнопок дней недели + "❌ Выкл" восьмой кнопкой (вместо
+    прежней карусели в одной кнопке, см. комментарий у SHOPPING_CYCLE_LABELS
+    выше), плюс степпер времени (см. _time_stepper_rows). Выбранный сейчас
+    вариант помечается галочкой "✓" прямо в подписи кнопки — отдельного
+    выделения цветом/рамкой Telegram для инлайн-кнопок не даёт. Новая, по
+    умолчанию выключенная фича — см. User.shopping_reminder_enabled/
+    shopping_reminder_weekday/shopping_reminder_time_minutes.
     """
     builder = InlineKeyboardBuilder()
-    state = shopping_cycle_state(enabled, weekday)
-    cycle_display = " · ".join(
-        f"[{label}]" if i == state else label for i, label in enumerate(SHOPPING_CYCLE_LABELS)
-    )
-    builder.button(text="◀️", callback_data="shcycle:-1")
-    builder.button(text=cycle_display, callback_data=NOOP_CALLBACK)
-    builder.button(text="▶️", callback_data="shcycle:1")
+
+    for i, label in enumerate(SHOPPING_DAY_GRID_LABELS):
+        text = f"{label} ✓" if enabled and weekday == i else label
+        builder.button(text=text, callback_data=f"shpick:{i}")
+
+    off_text = "❌ Выкл ✓" if not enabled else "❌ Выкл"
+    builder.button(text=off_text, callback_data="shpick:off")
 
     _time_stepper_rows(builder, time_minutes, "shtime_adj")
 
     builder.button(text=_SEPARATOR_LABEL, callback_data=NOOP_CALLBACK)
     builder.button(text="◀️ Назад к уведомлениям", callback_data="notif_open")
-    builder.adjust(3, 3, 3, 1, 1)
+    builder.adjust(4, 4, 3, 3, 1, 1)
     return builder
 
 

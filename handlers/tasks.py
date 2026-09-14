@@ -210,13 +210,20 @@ def _split_tasks_by_category(tasks: list) -> dict:
     """
     Раскладывает уже полученный список (get_active_tasks_by_deadline —
     свои + общие партнёра) на вкладки-категории списка задач (см.
-    keyboards.TASKS_FILTER_*): "Все" — как есть, плюс по одной вкладке на
-    каждое значение database.models.TaskCategory. В отличие от прежних
-    "Мои"/"Общие" — деление ЧИСТО по категории, а не по владельцу; личное
-    и общее внутри одной категории показываются вместе, просто в разных
-    блоках текста (см. texts.tasks_list_text).
+    keyboards.TASKS_FILTER_*): плюс по одной вкладке на каждое значение
+    database.models.TaskCategory. В отличие от прежних "Мои"/"Общие" —
+    деление ЧИСТО по категории, а не по владельцу; личное и общее внутри
+    одной категории показываются вместе, просто в разных блоках текста
+    (см. texts.tasks_list_text).
+
+    "Все" (TASKS_FILTER_ALL) специально ИСКЛЮЧАЕТ покупки — у них уже есть
+    своя выделенная вкладка "🛒 Покупки", и с учётом того, что список
+    покупок обычно самый длинный и часто меняется (галочки), он захламлял
+    общий список (жалоба пользователя: "начинается захламление"). Счётчик
+    "Все (N)" в keyboards.tasks_page_keyboard считается от этого же
+    итогового списка, так что тоже больше не включает покупки.
     """
-    by_category: dict = {TASKS_FILTER_ALL: tasks}
+    by_category: dict = {TASKS_FILTER_ALL: [t for t in tasks if t.category != TaskCategory.purchases]}
     for cat in TaskCategory:
         by_category[cat.value] = [t for t in tasks if t.category == cat]
     return by_category
