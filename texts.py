@@ -1201,6 +1201,28 @@ def profile_actions_text() -> str:
     return "⚙️ Ещё немного настроек:"
 
 
+_WEEKDAY_LABELS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def format_time_of_day(minutes: int) -> str:
+    """
+    "HH:MM" из "минут от полуночи" — общий формат хранения всех
+    настраиваемых времён уведомлений (см. User.quiet_hours_start_minutes и
+    соседние поля в database/models.py). minutes % (24*60) — подстраховка
+    на случай значения ровно 1440 или отрицательного (степперы в
+    database.requests._adjust_time_field и так всегда крутят по кругу
+    0..1439, это просто защита на уровне форматирования).
+    """
+    minutes = minutes % (24 * 60)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def weekday_short_label(weekday: int) -> str:
+    """Короткая подпись дня недели (0=понедельник...6=воскресенье, как
+    datetime.weekday()) — для экрана "🛒 Напоминание о покупках"."""
+    return _WEEKDAY_LABELS_SHORT[weekday % 7]
+
+
 def format_utc_offset(minutes: int) -> str:
     """
     Короткая подпись смещения часового пояса, например "UTC+3" или
@@ -1246,6 +1268,76 @@ def notifications_settings_text() -> str:
     return (
         "🔔 <b>Уведомления</b>\n"
         "Нажимай на пункт, чтобы включить или выключить 👇"
+    )
+
+
+def morning_checklist_time_text(enabled: bool, time_minutes: int) -> str:
+    """Экран "⏰ Утренний чек-лист" (Профиль → 🔔 Уведомления → пункт
+    "Утренний чек-лист", см. handlers/profile.py::mctime_open/mctime_adjust) —
+    пассивный текстовый дайджест дел на сегодня, время настраивается
+    степпером ➖/➕ (см. keyboards.notif_time_screen_keyboard)."""
+    state = "включён" if enabled else "выключен"
+    return (
+        "⏰ <b>Утренний чек-лист</b>\n"
+        f"Короткая сводка дел на сегодня (и просроченных). Сейчас {state}, "
+        f"время отправки: <b>{format_time_of_day(time_minutes)}</b>."
+    )
+
+
+def checklist_morning_push_time_text(enabled: bool, time_minutes: int) -> str:
+    """Экран "☀️ Приглашение в чек-лист" (Premium, см.
+    handlers/profile.py::cmtime_open/cmtime_adjust) — приглашение в
+    интерактивный "☀️ Чек-лист дня", не путать с morning_checklist_time_text
+    выше (тот — пассивный текстовый дайджест)."""
+    state = "включено" if enabled else "выключено"
+    return (
+        "☀️ <b>Приглашение в чек-лист</b> 💎\n"
+        f"Пуш-приглашение заглянуть в интерактивный «☀️ Чек-лист дня». "
+        f"Сейчас {state}, время отправки: <b>{format_time_of_day(time_minutes)}</b>."
+    )
+
+
+def checklist_evening_push_time_text(enabled: bool, time_minutes: int) -> str:
+    """Экран "🌙 Вечерняя сводка чек-листа" (Premium, см.
+    handlers/profile.py::cetime_open/cetime_adjust)."""
+    state = "включена" if enabled else "выключена"
+    return (
+        "🌙 <b>Вечерняя сводка чек-листа</b> 💎\n"
+        f"Мягкая сводка по итогам дня, без чувства вины. Сейчас {state}, "
+        f"время отправки: <b>{format_time_of_day(time_minutes)}</b>."
+    )
+
+
+def quiet_hours_settings_text(enabled: bool, start_minutes: int, end_minutes: int) -> str:
+    """Экран "🌙 Тихие часы" (Профиль → 🔔 Уведомления → "Тихие часы", см.
+    handlers/profile.py::qh_open/qh_adjust) — теперь с настраиваемыми
+    границами (раньше были жёстко зашиты 22:00–08:00, см.
+    services.scheduler._apply_quiet_hours)."""
+    state = "включены" if enabled else "выключены"
+    return (
+        "🌙 <b>Тихие часы</b>\n"
+        "Любое напоминание, которое должно было бы прийти в это окно, "
+        "откладывается до его конца.\n\n"
+        f"Сейчас {state}: <b>{format_time_of_day(start_minutes)}–{format_time_of_day(end_minutes)}</b>."
+    )
+
+
+def shopping_reminder_settings_text(enabled: bool, weekday: int, time_minutes: int) -> str:
+    """Экран "🛒 Напоминание о покупках" (Профиль → 🔔 Уведомления →
+    "Напоминание о покупках", см. handlers/profile.py::shprmd_open) — новая
+    еженедельная фича, по умолчанию выключена (см.
+    User.shopping_reminder_enabled). Если список "🛒 Покупки" пуст в момент
+    срабатывания — пуш просто не приходит (см.
+    services.scheduler._send_one_shopping_reminder), отдельно объясняем
+    это здесь же, чтобы не удивлять тишиной."""
+    state = "включено" if enabled else "выключено"
+    return (
+        "🛒 <b>Напоминание о покупках</b>\n"
+        "Один раз в неделю — мягкий пинг заглянуть в список покупок, если "
+        "там есть хоть один активный пункт (пустой список — тишина, без "
+        "лишних пушей).\n\n"
+        f"Сейчас {state}: <b>{weekday_short_label(weekday)}, "
+        f"{format_time_of_day(time_minutes)}</b>."
     )
 
 
@@ -1431,6 +1523,27 @@ def purchase_added_text(title: str) -> str:
     выбирать ему приоритет.
     """
     return f"🛒 Добавлено в покупки: «{escape(title)}»"
+
+
+# Еженедельное напоминание про "🛒 Покупки" (см. User.shopping_reminder_*,
+# services.scheduler._send_one_shopping_reminder) — мягкий, ненавязчивый
+# тон в духе кота-компаньона Томаса, БЕЗ конкретных товаров и цифр (в
+# отличие от текстовых дайджестов чек-листа): просто ласковый повод
+# заглянуть в список, когда будет удобно, а не команда "иди в магазин".
+SHOPPING_REMINDER_PHRASES = [
+    "🐾 Мягкий маячок: в списке покупок накопилось несколько позиций. Заглянем в магазин, когда будет по пути? ✨",
+    "Хвостики, холодильник намекает, что пора в супермаркет. В списке висит пара нужных вещей 🛒",
+    "🐾 Напоминалка от Томаса: список покупок ждёт своего часа. Если планируешь вылазку — всё под рукой ✨",
+    "Закинул лапку: в покупках есть активные пункты. Заглянем в магазин без спешки, когда будет удобно? ☕️",
+    "🐾 Небольшая сводка: в списке покупок накопилось несколько позиций. Пусть закупка пройдёт легко и налегке ✨",
+    "Мягкий пинг: список покупок не пустует. Заглянем за необходимым, когда появится ресурс? 🌿",
+]
+
+
+def random_shopping_reminder_phrase() -> str:
+    """Случайная реплика для еженедельного напоминания про покупки (см.
+    SHOPPING_REMINDER_PHRASES)."""
+    return random.choice(SHOPPING_REMINDER_PHRASES)
 
 
 def purchases_added_text(titles: list[str]) -> str:

@@ -57,8 +57,9 @@ from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import texts
-from database.models import ReminderOffset, Status
+from database.models import ReminderOffset, Status, TaskCategory
 from database.requests import (
+    get_active_tasks,
     get_all_users,
     get_checklist_tasks_for_today,
     get_pending_reminders,
@@ -69,6 +70,7 @@ from database.requests import (
     get_users_with_checklist_evening_push_enabled,
     get_users_with_checklist_morning_push_enabled,
     get_users_with_morning_checklist_enabled,
+    get_users_with_shopping_reminder_enabled,
     get_visible_habits_today,
     has_effective_premium,
     mark_reminder_second_chance_sent,
@@ -76,7 +78,7 @@ from database.requests import (
     reschedule_reminder,
     reset_daily_habits_for_user,
 )
-from keyboards import checklist_push_open_keyboard, reminder_notification_keyboard
+from keyboards import checklist_push_open_keyboard, reminder_notification_keyboard, shopping_reminder_keyboard
 from services import timeutils
 from services.leveling import XP_BY_PRIORITY, XP_PER_TASK
 
@@ -96,31 +98,32 @@ _STALE_REMINDER_THRESHOLD = timedelta(hours=6)
 # если задача так и осталась не закрыта (см. _maybe_send_second_chance).
 _SECOND_CHANCE_DELAY = timedelta(hours=2)
 
-# Тихие часы: с 22:00 и до 08:00 звуковых пушей быть не должно (см.
-# _apply_quiet_hours) — всё, что попадает в это окно, откладывается до
-# ровно 09:00 (совпадает с временем утреннего чек-листа не случайно —
-# это то же самое "утро уже началось, можно присылать").
-_QUIET_HOURS_START = 22
-_QUIET_HOURS_END = 8
-_QUIET_HOURS_RESUME = time(9, 0)
-
-# Время ежедневного утреннего чек-листа, ПО ЛИЧНОМУ времени каждого (см.
-# _daily_ticker/_send_one_morning_checklist).
-_MORNING_CHECKLIST_TIME = time(9, 0)
-
-# Время пушей интерактивного модуля "☀️ Чек-лист дня" (см.
-# _send_one_checklist_morning_brief/_send_one_checklist_evening_summary) —
-# не то же самое, что _MORNING_CHECKLIST_TIME выше (тот — пассивный
-# текстовый дайджест, эти два — приглашения в интерактивный экран), хоть
-# утреннее время и совпадает намеренно (оба про "начало дня").
-_CHECKLIST_MORNING_PUSH_TIME = time(9, 0)
-_CHECKLIST_EVENING_PUSH_TIME = time(21, 0)
-
-# Полуночный сброс "сделано сегодня"/"скрыто сегодня" у всех привычек (см.
-# _daily_ticker/database.requests.reset_daily_habits_for_user) — новый
-# день должен начинаться с чистого листа без какого-либо ручного действия
-# пользователя.
+# Тихие часы, время ежедневного утреннего чек-листа, время пушей
+# интерактивного "☀️ Чек-лист дня" (утро/вечер) и время еженедельного
+# напоминания про "🛒 Покупки" РАНЬШЕ были захардкожены здесь одними и
+# теми же константами на всех (22:00–08:00 / 09:00 / 09:00 / 21:00). По
+# просьбе "хочу сама выбирать тихие часы и время чек-листов" это теперь
+# ПЕРСОНАЛЬНЫЕ настройки каждого пользователя (см. database/models.py::
+# User.quiet_hours_start_minutes/quiet_hours_end_minutes/
+# morning_checklist_time_minutes/checklist_morning_push_time_minutes/
+# checklist_evening_push_time_minutes/shopping_reminder_*) — читаются
+# прямо из объекта user на каждой проверке (см. _minutes_to_time ниже),
+# а не из модульных констант. Полуночный сброс привычек остаётся общим
+# для всех, ровно 00:00 — отдельной настройки под него не просили.
 _HABITS_RESET_TIME = time(0, 0)
+
+
+def _minutes_to_time(minutes: int) -> time:
+    """
+    Переводит "минуты от полуночи" (как хранятся все персональные времена
+    уведомлений, см. комментарий выше) обратно в datetime.time для
+    сравнения в _matches_local_time. minutes ожидается уже в диапазоне
+    0..1439 (см. database.requests._adjust_time_field, где значение
+    крутится по кругу) — % 1440 здесь просто подстраховка на случай
+    "сырого" значения прямо из БД.
+    """
+    minutes = minutes % (24 * 60)
+    return time(minutes // 60, minutes % 60)
 
 
 def _job_id(task_id: int, offset: ReminderOffset) -> str:
@@ -131,13 +134,29 @@ def _second_chance_job_id(reminder_id: int) -> str:
     return f"second_chance_{reminder_id}"
 
 
-def _apply_quiet_hours(remind_at: datetime, utc_offset_minutes: int) -> datetime:
+def _apply_quiet_hours(
+    remind_at: datetime, utc_offset_minutes: int, start_minutes: int, end_minutes: int
+) -> datetime:
     """
-    Если remind_at (время СЕРВЕРА) попадает в окно "Тихих часов"
-    (22:00–08:00) ПО ЛИЧНОМУ часовому поясу пользователя — переносит его
-    на 09:00 (тоже личное) ближайшего подходящего дня: с полуночи до
-    восьми утра — на 09:00 ТОГО ЖЕ дня, с 22:00 и позже — на 09:00
-    СЛЕДУЮЩЕГО дня. Иначе возвращает время как есть.
+    Если remind_at (время СЕРВЕРА) попадает в ПЕРСОНАЛЬНОЕ окно "Тихих
+    часов" [start_minutes; end_minutes) ПО ЛИЧНОМУ часовому поясу
+    пользователя (оба — минуты от полуночи, настраиваются в профиле, см.
+    User.quiet_hours_start_minutes/quiet_hours_end_minutes) — переносит
+    его РОВНО на момент end_minutes ближайшего подходящего дня, иначе
+    возвращает время как есть.
+
+    Обычный случай — окно "через полночь" (например 22:00–08:00,
+    start > end): с полуночи и до end — на end ТОГО ЖЕ дня, с start и
+    позже — на end СЛЕДУЮЩЕГО дня. Если человек всё же выставил окно
+    ВНУТРИ одного дня (start < end, например "13:00–14:00" — редкий, но
+    не запрещённый выбор степпером) — попадание проверяется как
+    start <= local_minutes < end, перенос на end этого же дня. start ==
+    end — вырожденный случай (окно нулевой длины), ничего не сдвигаем.
+
+    Раньше окно было одно на всех и жёстко 22:00–08:00, резюме всегда
+    09:00 (с часовым запасом "на всякий случай"); теперь, когда конец
+    окна настраивается сама пользователем, естественнее возобновлять
+    ровно в НЕЁ указанный момент, а не с дополнительным отступом.
 
     Раньше окно проверялось по времени СЕРВЕРА — если его часовой пояс не
     совпадал с личным, "тихие часы" реально приходились на совсем другие
@@ -147,13 +166,24 @@ def _apply_quiet_hours(remind_at: datetime, utc_offset_minutes: int) -> datetime
     хранение и APScheduler по-прежнему ничего не знают о часовых поясах.
     """
     local = timeutils.to_user(remind_at, utc_offset_minutes)
-    hour = local.hour
-    if hour >= _QUIET_HOURS_START:
-        local_resume = datetime.combine(local.date() + timedelta(days=1), _QUIET_HOURS_RESUME)
-    elif hour < _QUIET_HOURS_END:
-        local_resume = datetime.combine(local.date(), _QUIET_HOURS_RESUME)
+    local_minutes = local.hour * 60 + local.minute
+    resume_time = _minutes_to_time(end_minutes)
+
+    if start_minutes > end_minutes:
+        if local_minutes >= start_minutes:
+            local_resume = datetime.combine(local.date() + timedelta(days=1), resume_time)
+        elif local_minutes < end_minutes:
+            local_resume = datetime.combine(local.date(), resume_time)
+        else:
+            return remind_at
+    elif start_minutes < end_minutes:
+        if start_minutes <= local_minutes < end_minutes:
+            local_resume = datetime.combine(local.date(), resume_time)
+        else:
+            return remind_at
     else:
         return remind_at
+
     return timeutils.to_server(local_resume, utc_offset_minutes)
 
 
@@ -161,11 +191,13 @@ async def schedule_reminder(task_id: int, offset: ReminderOffset, reminder_id: i
     """
     Ставит (или переставляет — replace_existing) таймер на конкретное
     напоминание. Если у пользователя включены "Тихие часы" (по умолчанию
-    да) и remind_at попадает в окно 22:00–08:00 — фактическое время
-    срабатывания сдвигается на 09:00 (см. _apply_quiet_hours); в БД сама
-    запись Reminder.remind_at при этом не трогается — сдвиг чисто на
-    уровне таймера, чтобы при выключении "Тихих часов" не потребовался
-    отдельный пересчёт всех уже сохранённых записей.
+    да) и remind_at попадает в его персональное окно (см.
+    User.quiet_hours_start_minutes/quiet_hours_end_minutes) — фактическое
+    время срабатывания сдвигается на конец этого окна (см.
+    _apply_quiet_hours); в БД сама запись Reminder.remind_at при этом не
+    трогается — сдвиг чисто на уровне таймера, чтобы при выключении
+    "Тихих часов" не потребовался отдельный пересчёт всех уже сохранённых
+    записей.
     misfire_grace_time — если процесс на секунды/минуты "притормозил"
     ровно в момент срабатывания, уведомление всё равно уйдёт, а не
     потеряется молча.
@@ -176,7 +208,10 @@ async def schedule_reminder(task_id: int, offset: ReminderOffset, reminder_id: i
         _, task = found
         user = await get_user(task.user_id)
         if user is not None and user.quiet_hours_enabled:
-            effective_time = _apply_quiet_hours(remind_at, user.utc_offset_minutes)
+            effective_time = _apply_quiet_hours(
+                remind_at, user.utc_offset_minutes,
+                user.quiet_hours_start_minutes, user.quiet_hours_end_minutes,
+            )
 
     scheduler.add_job(
         _fire_reminder,
@@ -415,10 +450,36 @@ async def _send_one_checklist_evening_summary(user) -> None:
         pass
 
 
+async def _send_one_shopping_reminder(user) -> None:
+    """
+    Еженедельный мягкий пинг "загляни в список покупок" ДЛЯ ОДНОГО
+    пользователя (см. User.shopping_reminder_*, _daily_ticker ниже). Если
+    в "🛒 Покупки" на данный момент нет ни одного активного пункта — не
+    шлём вообще: пуш "загляни в пустой список" не имеет смысла и был бы
+    просто лишним шумом (см. get_active_tasks — тот же список, что видит
+    сама вкладка "🛒 Покупки", включая общие с партнёром пункты).
+    Случайная фраза — та же идея, что и у остальных "живых" реплик Томаса
+    (см. texts.random_shopping_reminder_phrase).
+    """
+    active_tasks = await get_active_tasks(user.user_id)
+    purchases_count = sum(1 for t in active_tasks if t.category == TaskCategory.purchases)
+    if purchases_count == 0:
+        return
+
+    try:
+        await _bot.send_message(
+            chat_id=user.user_id,
+            text=texts.random_shopping_reminder_phrase(),
+            reply_markup=shopping_reminder_keyboard().as_markup(),
+        )
+    except TelegramBadRequest:
+        pass
+
+
 def _matches_local_time(user, target: time) -> bool:
     """Наступила ли у КОНКРЕТНОГО пользователя (по его личному часовому
     поясу, User.utc_offset_minutes) ровно указанная минута суток —
-    используется _daily_ticker сразу для всех четырёх ежедневных
+    используется _daily_ticker сразу для всех ежедневных/еженедельных
     пушей/сбросов."""
     local_now = timeutils.user_now(user.utc_offset_minutes)
     return (local_now.hour, local_now.minute) == (target.hour, target.minute)
@@ -426,22 +487,24 @@ def _matches_local_time(user, target: time) -> bool:
 
 async def _daily_ticker() -> None:
     """
-    Тикает раз в минуту (см. init_scheduler) и заменяет собой четыре
-    отдельных cron-задачи по ЕДИНОМУ времени сервера, которые были здесь
-    раньше: утренний текстовый чек-лист, приглашение и вечерняя сводка
-    интерактивного чек-листа дня, полуночный сброс привычек. Теперь
-    "09:00"/"21:00"/"00:00" проверяются в ЛИЧНОМ часовом поясе КАЖДОГО
-    пользователя по отдельности (см. _matches_local_time) — иначе,
-    например, "утренний чек-лист в 09:00" на самом деле приходил в 09:00
-    по времени СЕРВЕРА, что могло оказаться совсем другим часом у
-    реального человека, если часовой пояс сервера не совпадает с его
-    собственным.
+    Тикает раз в минуту (см. init_scheduler) и заменяет собой отдельные
+    cron-задачи по ЕДИНОМУ времени сервера, которые были здесь раньше:
+    утренний текстовый чек-лист, приглашение и вечерняя сводка
+    интерактивного чек-листа дня, полуночный сброс привычек, а теперь ещё
+    и еженедельное напоминание про "🛒 Покупки". Время каждого из них —
+    ПЕРСОНАЛЬНАЯ настройка КАЖДОГО пользователя (User.*_time_minutes, см.
+    database/models.py и профиль → "🔔 Уведомления"), проверяется в его
+    ЛИЧНОМ часовом поясе (см. _matches_local_time) — иначе, например,
+    "утренний чек-лист в 09:00" на самом деле приходил в 09:00 по времени
+    СЕРВЕРА, что могло оказаться совсем другим часом у реального человека,
+    если часовой пояс сервера не совпадает с его собственным. Полуночный
+    сброс привычек — единственный без отдельной настройки, всегда 00:00.
     """
     if _bot is None:
         return
 
     for user in await get_users_with_morning_checklist_enabled():
-        if _matches_local_time(user, _MORNING_CHECKLIST_TIME):
+        if _matches_local_time(user, _minutes_to_time(user.morning_checklist_time_minutes)):
             await _send_one_morning_checklist(user)
 
     for user in await get_users_with_checklist_morning_push_enabled():
@@ -449,12 +512,26 @@ async def _daily_ticker() -> None:
         # вечерняя сводка чек-листа теперь платные; сам переключатель в
         # настройках уведомлений при этом не трогаем, чтобы после
         # оформления Premium ничего не пришлось включать заново.
-        if _matches_local_time(user, _CHECKLIST_MORNING_PUSH_TIME) and await has_effective_premium(user.user_id):
+        if (
+            _matches_local_time(user, _minutes_to_time(user.checklist_morning_push_time_minutes))
+            and await has_effective_premium(user.user_id)
+        ):
             await _send_one_checklist_morning_brief(user)
 
     for user in await get_users_with_checklist_evening_push_enabled():
-        if _matches_local_time(user, _CHECKLIST_EVENING_PUSH_TIME) and await has_effective_premium(user.user_id):
+        if (
+            _matches_local_time(user, _minutes_to_time(user.checklist_evening_push_time_minutes))
+            and await has_effective_premium(user.user_id)
+        ):
             await _send_one_checklist_evening_summary(user)
+
+    for user in await get_users_with_shopping_reminder_enabled():
+        local_now = timeutils.user_now(user.utc_offset_minutes)
+        if (
+            local_now.weekday() == user.shopping_reminder_weekday
+            and _matches_local_time(user, _minutes_to_time(user.shopping_reminder_time_minutes))
+        ):
+            await _send_one_shopping_reminder(user)
 
     for user in await get_all_users():
         if _matches_local_time(user, _HABITS_RESET_TIME):

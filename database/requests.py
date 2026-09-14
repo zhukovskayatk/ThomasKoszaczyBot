@@ -679,6 +679,107 @@ async def get_users_with_checklist_evening_push_enabled() -> list[User]:
         return list(result.scalars().all())
 
 
+# --- Настраиваемое время уведомлений (Тихие часы/время чек-листов) -------------
+
+_MINUTES_IN_DAY = 24 * 60
+
+
+async def _adjust_time_field(user_id: int, field: str, delta_minutes: int) -> int | None:
+    """
+    Общий helper для степперов времени в настройках (➖1ч/➕15м — тот же
+    приём, что и в keyboards.time_drum_keyboard) — крутит значение ПО
+    КРУГУ внутри одних суток (0..1439 минут), а не "убегает" в
+    отрицательные числа или за полночь без сброса. Используется сразу для
+    Тихих часов (начало/конец) и времени всех трёх ежедневных чек-лист-
+    пушей — везде одна и та же механика, отличается только имя поля.
+    Возвращает новое значение в минутах от полуночи, или None, если
+    пользователь не найден.
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return None
+        current = getattr(user, field)
+        new_value = (current + delta_minutes) % _MINUTES_IN_DAY
+        setattr(user, field, new_value)
+        await session.commit()
+        return new_value
+
+
+async def adjust_quiet_hours_start(user_id: int, delta_minutes: int) -> int | None:
+    """Степпер начала "Тихих часов" (см. User.quiet_hours_start_minutes,
+    handlers/profile.py::quiet_adjust)."""
+    return await _adjust_time_field(user_id, "quiet_hours_start_minutes", delta_minutes)
+
+
+async def adjust_quiet_hours_end(user_id: int, delta_minutes: int) -> int | None:
+    """Степпер конца "Тихих часов" (см. User.quiet_hours_end_minutes,
+    handlers/profile.py::quiet_adjust)."""
+    return await _adjust_time_field(user_id, "quiet_hours_end_minutes", delta_minutes)
+
+
+async def adjust_morning_checklist_time(user_id: int, delta_minutes: int) -> int | None:
+    """Степпер времени утреннего текстового чек-листа (см.
+    User.morning_checklist_time_minutes, handlers/profile.py::morningtime_adjust)."""
+    return await _adjust_time_field(user_id, "morning_checklist_time_minutes", delta_minutes)
+
+
+async def adjust_checklist_morning_push_time(user_id: int, delta_minutes: int) -> int | None:
+    """Степпер времени пуша-приглашения в интерактивный чек-лист дня (см.
+    User.checklist_morning_push_time_minutes, handlers/profile.py::cmtime_adjust)."""
+    return await _adjust_time_field(user_id, "checklist_morning_push_time_minutes", delta_minutes)
+
+
+async def adjust_checklist_evening_push_time(user_id: int, delta_minutes: int) -> int | None:
+    """Степпер времени вечерней сводки чек-листа дня (см.
+    User.checklist_evening_push_time_minutes, handlers/profile.py::cetime_adjust)."""
+    return await _adjust_time_field(user_id, "checklist_evening_push_time_minutes", delta_minutes)
+
+
+# --- Еженедельное напоминание про "🛒 Покупки" ---------------------------------
+
+async def toggle_shopping_reminder_enabled(user_id: int) -> bool:
+    """Переключает еженедельное напоминание про список покупок и
+    возвращает новое значение (см. User.shopping_reminder_enabled) — в
+    отличие от остальных переключателей уведомлений, у этого значение по
+    умолчанию False (см. комментарий у поля в database/models.py)."""
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return False
+        user.shopping_reminder_enabled = not user.shopping_reminder_enabled
+        await session.commit()
+        return user.shopping_reminder_enabled
+
+
+async def set_shopping_reminder_weekday(user_id: int, weekday: int) -> bool:
+    """Устанавливает день недели напоминания про покупки (0=понедельник...
+    6=воскресенье, как datetime.weekday()), см. User.shopping_reminder_weekday."""
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return False
+        user.shopping_reminder_weekday = weekday % 7
+        await session.commit()
+        return True
+
+
+async def adjust_shopping_reminder_time(user_id: int, delta_minutes: int) -> int | None:
+    """Степпер времени напоминания про покупки (см.
+    User.shopping_reminder_time_minutes, handlers/profile.py::shprmdtime_adjust)."""
+    return await _adjust_time_field(user_id, "shopping_reminder_time_minutes", delta_minutes)
+
+
+async def get_users_with_shopping_reminder_enabled() -> list[User]:
+    """Пользователи с включённым еженедельным напоминанием про покупки
+    (см. services.scheduler._daily_ticker/_send_one_shopping_reminder)."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(User).where(User.shopping_reminder_enabled.is_(True))
+        )
+        return list(result.scalars().all())
+
+
 async def get_tasks_due_today_or_overdue(user_id: int) -> list[Task]:
     """
     Активные задачи с дедлайном сегодня или раньше (просроченные) —

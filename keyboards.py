@@ -22,9 +22,11 @@ from texts import (
     REMINDER_OFFSET_LABELS,
     URGENCY_MARKERS,
     button_deadline_suffix,
+    format_time_of_day,
     format_utc_offset,
     reminder_label,
     task_urgency_category,
+    weekday_short_label,
 )
 
 # --- Тексты постоянных кнопок внизу экрана ------------------------------------
@@ -914,49 +916,169 @@ def timezone_settings_keyboard(offset_minutes: int) -> InlineKeyboardBuilder:
     return builder
 
 
-def notification_settings_keyboard(
-    reminders_enabled: bool,
-    quiet_hours_enabled: bool,
-    morning_checklist_enabled: bool,
-    checklist_morning_push_enabled: bool,
-    checklist_evening_push_enabled: bool,
-) -> InlineKeyboardBuilder:
+def notification_settings_keyboard(user) -> InlineKeyboardBuilder:
     """
-    Экран "🔔 Уведомления" (Профиль и Настройки → 🔔 Уведомления) — пять
-    переключателей (см. User.reminders_enabled/quiet_hours_enabled/
-    morning_checklist_enabled/checklist_morning_push_enabled/
-    checklist_evening_push_enabled). Каждый клик сразу меняет состояние в
-    БД и перерисовывает галочку на месте (edit_message_reply_markup) — без
-    отдельной кнопки "Сохранить", изменения применяются мгновенно.
+    Экран "🔔 Уведомления" (Профиль и Настройки → 🔔 Уведомления) — строится
+    из целого User (а не из отдельных булевых полей, как раньше), потому
+    что теперь у трёх ежедневных пушей и "Тихих часов" есть ещё и
+    НАСТРАИВАЕМОЕ ВРЕМЯ (раньше жёстко зашитое 09:00/09:00/21:00/
+    22:00–08:00 на всех, см. database/models.py::User.*_time_minutes) —
+    тап по такой строке теперь открывает ОТДЕЛЬНЫЙ экран с переключателем
+    И степпером времени (см. notif_time_screen_keyboard/
+    quiet_hours_screen_keyboard ниже), а не переключает галочку сразу на
+    месте, как раньше (сама галочка на этой, общей, кнопке при этом
+    по-прежнему показывает актуальное состояние). "Напоминания по
+    задачам" временем не управляет — как и раньше, это прямой тумблер.
 
-    Два новых пункта (утренний/вечерний пуш чек-листа дня) — НЕ то же
-    самое, что "Утренний чек-лист (09:00)" выше: тот — пассивный текстовый
-    дайджест (бесплатно у всех), эти два — приглашения в интерактивный
-    экран "☀️ Чек-лист дня" и теперь Premium-фича (метка 💎 в подписи, см.
-    services.scheduler._daily_ticker — реально приходят только при
-    активном эффективном Premium, сам переключатель при этом можно
-    держать включённым заранее).
+    Новая строка "🛒 Напоминание о покупках" — отдельная, ПО УМОЛЧАНИЮ
+    ВЫКЛЮЧЕННАЯ еженедельная фича (см. User.shopping_reminder_*,
+    shopping_reminder_screen_keyboard) — в скобках либо "выкл", либо уже
+    выбранные день недели и время.
     """
     builder = InlineKeyboardBuilder()
-    morning_mark = "☑️" if morning_checklist_enabled else "◻️"
-    reminders_mark = "☑️" if reminders_enabled else "◻️"
-    quiet_mark = "☑️" if quiet_hours_enabled else "◻️"
-    checklist_morning_mark = "☑️" if checklist_morning_push_enabled else "◻️"
-    checklist_evening_mark = "☑️" if checklist_evening_push_enabled else "◻️"
-    builder.button(text=f"{morning_mark} Утренний чек-лист (09:00)", callback_data="notif_toggle:morning")
-    builder.button(text=f"{reminders_mark} Напоминания по задачам", callback_data="notif_toggle:reminders")
-    builder.button(text=f"{quiet_mark} 🌙 Тихие часы (22:00–08:00)", callback_data="notif_toggle:quiet")
+    morning_mark = "☑️" if user.morning_checklist_enabled else "◻️"
+    reminders_mark = "☑️" if user.reminders_enabled else "◻️"
+    quiet_mark = "☑️" if user.quiet_hours_enabled else "◻️"
+    checklist_morning_mark = "☑️" if user.checklist_morning_push_enabled else "◻️"
+    checklist_evening_mark = "☑️" if user.checklist_evening_push_enabled else "◻️"
+    shopping_mark = "☑️" if user.shopping_reminder_enabled else "◻️"
+
     builder.button(
-        text=f"{checklist_morning_mark} ☀️ Приглашение в чек-лист (09:00) 💎",
-        callback_data="notif_toggle:checklist_morning",
+        text=f"{morning_mark} ⏰ Утренний чек-лист ({format_time_of_day(user.morning_checklist_time_minutes)})",
+        callback_data="mctime_open",
+    )
+    builder.button(text=f"{reminders_mark} Напоминания по задачам", callback_data="notif_toggle:reminders")
+    builder.button(
+        text=(
+            f"{quiet_mark} 🌙 Тихие часы ({format_time_of_day(user.quiet_hours_start_minutes)}–"
+            f"{format_time_of_day(user.quiet_hours_end_minutes)})"
+        ),
+        callback_data="qh_open",
     )
     builder.button(
-        text=f"{checklist_evening_mark} 🌙 Вечерняя сводка чек-листа (21:00) 💎",
-        callback_data="notif_toggle:checklist_evening",
+        text=(
+            f"{checklist_morning_mark} ☀️ Приглашение в чек-лист "
+            f"({format_time_of_day(user.checklist_morning_push_time_minutes)}) 💎"
+        ),
+        callback_data="cmtime_open",
+    )
+    builder.button(
+        text=(
+            f"{checklist_evening_mark} 🌙 Вечерняя сводка чек-листа "
+            f"({format_time_of_day(user.checklist_evening_push_time_minutes)}) 💎"
+        ),
+        callback_data="cetime_open",
+    )
+    shopping_summary = (
+        f"{weekday_short_label(user.shopping_reminder_weekday)} "
+        f"{format_time_of_day(user.shopping_reminder_time_minutes)}"
+        if user.shopping_reminder_enabled else "выкл"
+    )
+    builder.button(
+        text=f"{shopping_mark} 🛒 Напоминание о покупках ({shopping_summary})", callback_data="shprmd_open"
     )
     builder.button(text="⏱ Изменить стандартные пресеты", callback_data="defrmd_open")
     builder.button(text="◀️ Назад к профилю", callback_data="notif_back")
-    builder.adjust(1, 1, 1, 1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1, 1, 1, 1)
+    return builder
+
+
+def notif_time_screen_keyboard(
+    enabled: bool, time_minutes: int, toggle_callback: str, adjust_prefix: str
+) -> InlineKeyboardBuilder:
+    """
+    Общий экран "переключатель + время" — переиспользуется сразу тремя
+    настройками (утренний чек-лист, приглашение и вечерняя сводка
+    интерактивного чек-листа дня, см. handlers/profile.py::
+    mctime_open/cmtime_open/cetime_open), у которых одинаковая форма:
+    один тумблер и один степпер времени. toggle_callback — ПОЛНЫЙ
+    callback_data тумблера (у каждого экрана свой собственный — "mctime_toggle"/
+    "cmtime_toggle"/"cetime_toggle", а НЕ общий "notif_toggle:...", как
+    раньше на главном экране уведомлений — иначе после тумблера человека
+    выкидывало бы обратно на главный экран уведомлений, а не оставляло на
+    текущем). adjust_prefix — префикс callback_data степпера (см.
+    handlers/profile.py::mctime_adjust/cmtime_adjust/cetime_adjust и
+    соответствующие database.requests.adjust_*_time). Степпер — тот же
+    приём ➖1ч/➕15м, что и в time_drum_keyboard/timezone_settings_keyboard,
+    значение меняется сразу, без отдельной кнопки "Сохранить".
+    """
+    builder = InlineKeyboardBuilder()
+    mark = "☑️" if enabled else "◻️"
+    builder.button(text=f"{mark} Включено", callback_data=toggle_callback)
+
+    label = format_time_of_day(time_minutes)
+    builder.button(text="➖ 1 ч", callback_data=f"{adjust_prefix}:-60")
+    builder.button(text=label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 1 ч", callback_data=f"{adjust_prefix}:60")
+    builder.button(text="➖ 15 м", callback_data=f"{adjust_prefix}:-15")
+    builder.button(text=label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 15 м", callback_data=f"{adjust_prefix}:15")
+
+    builder.button(text="◀️ Назад к уведомлениям", callback_data="notif_open")
+    builder.adjust(1, 3, 3, 1)
+    return builder
+
+
+def quiet_hours_screen_keyboard(enabled: bool, start_minutes: int, end_minutes: int) -> InlineKeyboardBuilder:
+    """
+    Экран "🌙 Тихие часы" (см. handlers/profile.py::qh_open/qh_adjust) —
+    как notif_time_screen_keyboard выше, но с ДВУМЯ независимыми
+    степперами (начало/конец окна) вместо одного — раньше окно было
+    жёстко зашито 22:00–08:00 на всех, см. User.quiet_hours_start_minutes/
+    quiet_hours_end_minutes.
+    """
+    builder = InlineKeyboardBuilder()
+    mark = "☑️" if enabled else "◻️"
+    builder.button(text=f"{mark} Включено", callback_data="qh_toggle")
+
+    start_label = f"🌙 Начало {format_time_of_day(start_minutes)}"
+    builder.button(text="➖ 1 ч", callback_data="qhs_adj:-60")
+    builder.button(text=start_label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 1 ч", callback_data="qhs_adj:60")
+    builder.button(text="➖ 15 м", callback_data="qhs_adj:-15")
+    builder.button(text=start_label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 15 м", callback_data="qhs_adj:15")
+
+    end_label = f"☀️ Конец {format_time_of_day(end_minutes)}"
+    builder.button(text="➖ 1 ч", callback_data="qhe_adj:-60")
+    builder.button(text=end_label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 1 ч", callback_data="qhe_adj:60")
+    builder.button(text="➖ 15 м", callback_data="qhe_adj:-15")
+    builder.button(text=end_label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 15 м", callback_data="qhe_adj:15")
+
+    builder.button(text="◀️ Назад к уведомлениям", callback_data="notif_open")
+    builder.adjust(1, 3, 3, 3, 3, 1)
+    return builder
+
+
+def shopping_reminder_screen_keyboard(enabled: bool, weekday: int, time_minutes: int) -> InlineKeyboardBuilder:
+    """
+    Экран "🛒 Напоминание о покупках" (см. handlers/profile.py::
+    shprmd_open/shprmd_adjust/shprmd_day) — тумблер + выбор дня недели
+    (радио-кнопки, тот же приём, что и в category_picker_keyboard) +
+    степпер времени. Новая, по умолчанию выключенная фича — см.
+    User.shopping_reminder_enabled/shopping_reminder_weekday/
+    shopping_reminder_time_minutes.
+    """
+    builder = InlineKeyboardBuilder()
+    mark = "☑️" if enabled else "◻️"
+    builder.button(text=f"{mark} Включено", callback_data="shprmd_toggle")
+
+    for i in range(7):
+        day_mark = "🔘" if i == weekday else "⚪️"
+        builder.button(text=f"{day_mark} {weekday_short_label(i)}", callback_data=f"shday_set:{i}")
+
+    label = format_time_of_day(time_minutes)
+    builder.button(text="➖ 1 ч", callback_data="shtime_adj:-60")
+    builder.button(text=label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 1 ч", callback_data="shtime_adj:60")
+    builder.button(text="➖ 15 м", callback_data="shtime_adj:-15")
+    builder.button(text=label, callback_data=NOOP_CALLBACK)
+    builder.button(text="➕ 15 м", callback_data="shtime_adj:15")
+
+    builder.button(text="◀️ Назад к уведомлениям", callback_data="notif_open")
+    builder.adjust(1, 4, 3, 3, 3, 1)
     return builder
 
 
@@ -1058,6 +1180,17 @@ def checklist_push_open_keyboard() -> InlineKeyboardBuilder:
     services.scheduler._send_checklist_morning_briefs, handlers/checklist.py::chk_open)."""
     builder = InlineKeyboardBuilder()
     builder.button(text="☀️ Открыть Чек-лист дня", callback_data="chk_open")
+    builder.adjust(1)
+    return builder
+
+
+def shopping_reminder_keyboard() -> InlineKeyboardBuilder:
+    """Кнопка под еженедельным напоминанием про "🛒 Покупки" (см.
+    services.scheduler._send_one_shopping_reminder) — сразу открывает
+    вкладку "Покупки" в списке задач, той же ссылкой, что и обычная
+    навигация по вкладкам (см. tasks_page_keyboard/handlers/tasks.py::tasks_page)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛒 Открыть список покупок", callback_data=f"tasks_page:0:{TASKS_FILTER_PURCHASES}")
     builder.adjust(1)
     return builder
 

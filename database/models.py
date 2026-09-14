@@ -223,6 +223,38 @@ class User(Base):
     checklist_morning_push_enabled: Mapped[bool] = mapped_column(default=True)
     checklist_evening_push_enabled: Mapped[bool] = mapped_column(default=True)
 
+    # --- Настраиваемое время уведомлений -------------------------------------
+    # Раньше "Тихие часы" (22:00–08:00) и время всех трёх ежедневных пушей
+    # (утренний чек-лист/приглашение в интерактивный чек-лист/вечерняя
+    # сводка) были захардкожены одинаково для всех (см. services/scheduler.py
+    # константы _QUIET_HOURS_*/_MORNING_CHECKLIST_TIME/..., которые теперь
+    # читаются отсюда per-user, а не из модуля). Хранятся МИНУТАМИ ОТ
+    # ПОЛУНОЧИ по ЛИЧНОМУ часовому поясу пользователя (тот же приём, что и
+    # utc_offset_minutes выше, только про время суток, а не про сдвиг) — так
+    # один int на настройку, а не отдельно час и минута; см.
+    # services/scheduler.py::_minutes_to_time про перевод обратно в time().
+    # Значения по умолчанию — старое захардкоженное поведение, чтобы у всех
+    # уже существующих пользователей после обновления ничего не изменилось,
+    # пока они сами не зайдут в настройки и не поменяют.
+    quiet_hours_start_minutes: Mapped[int] = mapped_column(default=22 * 60)
+    quiet_hours_end_minutes: Mapped[int] = mapped_column(default=8 * 60)
+    morning_checklist_time_minutes: Mapped[int] = mapped_column(default=9 * 60)
+    checklist_morning_push_time_minutes: Mapped[int] = mapped_column(default=9 * 60)
+    checklist_evening_push_time_minutes: Mapped[int] = mapped_column(default=21 * 60)
+
+    # --- Еженедельное напоминание про "🛒 Покупки" ---------------------------
+    # Новая, отдельная фича — В ОТЛИЧИЕ от уведомлений выше, ПО УМОЛЧАНИЮ
+    # ВЫКЛЮЧЕНА: это необязательный мягкий пинг "загляни в список покупок",
+    # а не часть базового сценария бота, включать его должен сам человек
+    # (см. handlers/profile.py::shprmd_toggle). weekday — 0=понедельник...
+    # 6=воскресенье, как datetime.weekday(); time_minutes — минуты от
+    # полуночи, тот же приём, что и время чек-листов выше. Если на момент
+    # срабатывания в "🛒 Покупки" нет ни одного активного пункта — пуш
+    # просто не отправляется (см. services.scheduler._send_one_shopping_reminder).
+    shopping_reminder_enabled: Mapped[bool] = mapped_column(default=False)
+    shopping_reminder_weekday: Mapped[int] = mapped_column(default=5)  # суббота
+    shopping_reminder_time_minutes: Mapped[int] = mapped_column(default=10 * 60)
+
     # --- Подписка Premium (оплата звёздами Telegram, см. handlers/subscription.py) ---
     # premium_until — момент, до которого действует подписка. None или дата
     # в прошлом = обычный бесплатный аккаунт. Намеренно ХРАНИМ ТОЛЬКО ЭТУ
@@ -521,6 +553,38 @@ async def _migrate_missing_columns(conn) -> None:
     if "default_reminder_offsets" not in existing_user_columns:
         await conn.exec_driver_sql(
             "ALTER TABLE users ADD COLUMN default_reminder_offsets TEXT NOT NULL DEFAULT ''"
+        )
+    if "quiet_hours_start_minutes" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN quiet_hours_start_minutes INTEGER NOT NULL DEFAULT 1320"
+        )
+    if "quiet_hours_end_minutes" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN quiet_hours_end_minutes INTEGER NOT NULL DEFAULT 480"
+        )
+    if "morning_checklist_time_minutes" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN morning_checklist_time_minutes INTEGER NOT NULL DEFAULT 540"
+        )
+    if "checklist_morning_push_time_minutes" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN checklist_morning_push_time_minutes INTEGER NOT NULL DEFAULT 540"
+        )
+    if "checklist_evening_push_time_minutes" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN checklist_evening_push_time_minutes INTEGER NOT NULL DEFAULT 1260"
+        )
+    if "shopping_reminder_enabled" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN shopping_reminder_enabled BOOLEAN NOT NULL DEFAULT 0"
+        )
+    if "shopping_reminder_weekday" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN shopping_reminder_weekday INTEGER NOT NULL DEFAULT 5"
+        )
+    if "shopping_reminder_time_minutes" not in existing_user_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN shopping_reminder_time_minutes INTEGER NOT NULL DEFAULT 600"
         )
 
     result = await conn.exec_driver_sql("PRAGMA table_info(tasks)")

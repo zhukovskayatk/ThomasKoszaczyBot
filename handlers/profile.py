@@ -20,6 +20,12 @@ from aiogram.types import CallbackQuery, Message
 import texts
 from database.models import ReminderOffset
 from database.requests import (
+    adjust_checklist_evening_push_time,
+    adjust_checklist_morning_push_time,
+    adjust_morning_checklist_time,
+    adjust_quiet_hours_end,
+    adjust_quiet_hours_start,
+    adjust_shopping_reminder_time,
     count_completed_tasks,
     get_default_reminder_offsets,
     get_or_create_user,
@@ -27,20 +33,25 @@ from database.requests import (
     get_user,
     rescue_streak_with_xp,
     set_default_reminder_offsets,
+    set_shopping_reminder_weekday,
     set_user_utc_offset,
     toggle_checklist_evening_push_enabled,
     toggle_checklist_morning_push_enabled,
     toggle_morning_checklist_enabled,
     toggle_quiet_hours_enabled,
     toggle_reminders_enabled,
+    toggle_shopping_reminder_enabled,
 )
 from keyboards import (
     LEGACY_PROFILE_BUTTON_TEXTS,
     PROFILE_BUTTON_TEXT,
     default_reminder_presets_keyboard,
     main_menu_keyboard,
+    notif_time_screen_keyboard,
     notification_settings_keyboard,
     profile_actions_keyboard,
+    quiet_hours_screen_keyboard,
+    shopping_reminder_screen_keyboard,
     streak_rescue_keyboard,
     timezone_settings_keyboard,
 )
@@ -157,8 +168,13 @@ async def streak_rescue(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "notif_open")
 async def notif_open(callback: CallbackQuery) -> None:
-    """Кнопка "🔔 Уведомления" под карточкой профиля — открывает экран трёх
-    переключателей (см. keyboards.notification_settings_keyboard)."""
+    """Кнопка "🔔 Уведомления" под карточкой профиля — открывает главный
+    экран уведомлений (см. keyboards.notification_settings_keyboard).
+    Пункты со своим настраиваемым временем (утренний чек-лист/приглашение
+    и вечерняя сводка интерактивного чек-листа/тихие часы/напоминание о
+    покупках) отсюда ведут на ОТДЕЛЬНЫЕ экраны (mctime_open/cmtime_open/
+    cetime_open/qh_open/shprmd_open ниже) — "Напоминания по задачам"
+    остаётся прямым тумблером прямо здесь."""
     user = await get_or_create_user(
         user_id=callback.from_user.id,
         username=callback.from_user.username,
@@ -166,23 +182,22 @@ async def notif_open(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.edit_text(
         texts.notifications_settings_text(),
-        reply_markup=notification_settings_keyboard(
-            user.reminders_enabled,
-            user.quiet_hours_enabled,
-            user.morning_checklist_enabled,
-            user.checklist_morning_push_enabled,
-            user.checklist_evening_push_enabled,
-        ).as_markup(),
+        reply_markup=notification_settings_keyboard(user).as_markup(),
     )
 
 
 @router.callback_query(F.data.startswith("notif_toggle:"))
 async def notif_toggle(callback: CallbackQuery) -> None:
     """
-    Клик по одному из переключателей — сразу меняет значение в БД и
-    перерисовывает галочку на месте (edit_message_reply_markup), без
-    отдельной кнопки "Сохранить": изменения применяются мгновенно, то же
-    самое поведение, что и у мультивыбора напоминаний (rmd_toggle).
+    Клик по переключателю ПРЯМО НА главном экране уведомлений — сейчас
+    это только "Напоминания по задачам" (единственный пункт без своего
+    отдельного экрана времени). Остальные поля здесь тоже поддерживаются
+    ради обратной совместимости — если у кого-то в чате ещё открыто
+    старое сообщение с кнопками ДО этого обновления (когда все пункты
+    переключались прямо тут), клик по нему всё ещё сработает, просто
+    вернёт на главный экран уведомлений, а не на отдельный (у НОВЫХ,
+    отдельных экранов — свои собственные callback'и: mctime_toggle/
+    cmtime_toggle/cetime_toggle/qh_toggle/shprmd_toggle ниже).
     """
     field = callback.data.split(":", maxsplit=1)[1]
 
@@ -196,6 +211,8 @@ async def notif_toggle(callback: CallbackQuery) -> None:
         await toggle_checklist_morning_push_enabled(callback.from_user.id)
     elif field == "checklist_evening":
         await toggle_checklist_evening_push_enabled(callback.from_user.id)
+    elif field == "shopping":
+        await toggle_shopping_reminder_enabled(callback.from_user.id)
 
     user = await get_user(callback.from_user.id)
     await callback.answer("Обновлено ✅")
@@ -203,15 +220,213 @@ async def notif_toggle(callback: CallbackQuery) -> None:
     if user is None:
         return
 
-    await callback.message.edit_reply_markup(
-        reply_markup=notification_settings_keyboard(
-            user.reminders_enabled,
-            user.quiet_hours_enabled,
-            user.morning_checklist_enabled,
-            user.checklist_morning_push_enabled,
-            user.checklist_evening_push_enabled,
-        ).as_markup()
+    await callback.message.edit_reply_markup(reply_markup=notification_settings_keyboard(user).as_markup())
+
+
+# --- Экран "⏰ Утренний чек-лист" ------------------------------------------------
+
+async def _render_mctime_screen(callback: CallbackQuery, toast: str | None = None) -> None:
+    user = await get_or_create_user(user_id=callback.from_user.id, username=callback.from_user.username)
+    if toast is not None:
+        await callback.answer(toast)
+    else:
+        await callback.answer()
+    await callback.message.edit_text(
+        texts.morning_checklist_time_text(user.morning_checklist_enabled, user.morning_checklist_time_minutes),
+        reply_markup=notif_time_screen_keyboard(
+            user.morning_checklist_enabled, user.morning_checklist_time_minutes, "mctime_toggle", "mctime_adj",
+        ).as_markup(),
     )
+
+
+@router.callback_query(F.data == "mctime_open")
+async def mctime_open(callback: CallbackQuery) -> None:
+    """"⏰ Утренний чек-лист" в "🔔 Уведомления" — переключатель + степпер
+    времени (см. keyboards.notif_time_screen_keyboard)."""
+    await _render_mctime_screen(callback)
+
+
+@router.callback_query(F.data == "mctime_toggle")
+async def mctime_toggle(callback: CallbackQuery) -> None:
+    await toggle_morning_checklist_enabled(callback.from_user.id)
+    await _render_mctime_screen(callback, "Обновлено ✅")
+
+
+@router.callback_query(F.data.startswith("mctime_adj:"))
+async def mctime_adjust(callback: CallbackQuery) -> None:
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    await adjust_morning_checklist_time(callback.from_user.id, delta)
+    await _render_mctime_screen(callback)
+
+
+# --- Экран "☀️ Приглашение в чек-лист" (Premium) --------------------------------
+
+async def _render_cmtime_screen(callback: CallbackQuery, toast: str | None = None) -> None:
+    user = await get_or_create_user(user_id=callback.from_user.id, username=callback.from_user.username)
+    if toast is not None:
+        await callback.answer(toast)
+    else:
+        await callback.answer()
+    await callback.message.edit_text(
+        texts.checklist_morning_push_time_text(
+            user.checklist_morning_push_enabled, user.checklist_morning_push_time_minutes
+        ),
+        reply_markup=notif_time_screen_keyboard(
+            user.checklist_morning_push_enabled, user.checklist_morning_push_time_minutes,
+            "cmtime_toggle", "cmtime_adj",
+        ).as_markup(),
+    )
+
+
+@router.callback_query(F.data == "cmtime_open")
+async def cmtime_open(callback: CallbackQuery) -> None:
+    await _render_cmtime_screen(callback)
+
+
+@router.callback_query(F.data == "cmtime_toggle")
+async def cmtime_toggle(callback: CallbackQuery) -> None:
+    await toggle_checklist_morning_push_enabled(callback.from_user.id)
+    await _render_cmtime_screen(callback, "Обновлено ✅")
+
+
+@router.callback_query(F.data.startswith("cmtime_adj:"))
+async def cmtime_adjust(callback: CallbackQuery) -> None:
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    await adjust_checklist_morning_push_time(callback.from_user.id, delta)
+    await _render_cmtime_screen(callback)
+
+
+# --- Экран "🌙 Вечерняя сводка чек-листа" (Premium) ------------------------------
+
+async def _render_cetime_screen(callback: CallbackQuery, toast: str | None = None) -> None:
+    user = await get_or_create_user(user_id=callback.from_user.id, username=callback.from_user.username)
+    if toast is not None:
+        await callback.answer(toast)
+    else:
+        await callback.answer()
+    await callback.message.edit_text(
+        texts.checklist_evening_push_time_text(
+            user.checklist_evening_push_enabled, user.checklist_evening_push_time_minutes
+        ),
+        reply_markup=notif_time_screen_keyboard(
+            user.checklist_evening_push_enabled, user.checklist_evening_push_time_minutes,
+            "cetime_toggle", "cetime_adj",
+        ).as_markup(),
+    )
+
+
+@router.callback_query(F.data == "cetime_open")
+async def cetime_open(callback: CallbackQuery) -> None:
+    await _render_cetime_screen(callback)
+
+
+@router.callback_query(F.data == "cetime_toggle")
+async def cetime_toggle(callback: CallbackQuery) -> None:
+    await toggle_checklist_evening_push_enabled(callback.from_user.id)
+    await _render_cetime_screen(callback, "Обновлено ✅")
+
+
+@router.callback_query(F.data.startswith("cetime_adj:"))
+async def cetime_adjust(callback: CallbackQuery) -> None:
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    await adjust_checklist_evening_push_time(callback.from_user.id, delta)
+    await _render_cetime_screen(callback)
+
+
+# --- Экран "🌙 Тихие часы" -------------------------------------------------------
+
+async def _render_qh_screen(callback: CallbackQuery, toast: str | None = None) -> None:
+    user = await get_or_create_user(user_id=callback.from_user.id, username=callback.from_user.username)
+    if toast is not None:
+        await callback.answer(toast)
+    else:
+        await callback.answer()
+    await callback.message.edit_text(
+        texts.quiet_hours_settings_text(
+            user.quiet_hours_enabled, user.quiet_hours_start_minutes, user.quiet_hours_end_minutes
+        ),
+        reply_markup=quiet_hours_screen_keyboard(
+            user.quiet_hours_enabled, user.quiet_hours_start_minutes, user.quiet_hours_end_minutes
+        ).as_markup(),
+    )
+
+
+@router.callback_query(F.data == "qh_open")
+async def qh_open(callback: CallbackQuery) -> None:
+    """"🌙 Тихие часы" в "🔔 Уведомления" — переключатель + два независимых
+    степпера (начало/конец окна, см. keyboards.quiet_hours_screen_keyboard) —
+    раньше окно было жёстко зашито 22:00–08:00 на всех."""
+    await _render_qh_screen(callback)
+
+
+@router.callback_query(F.data == "qh_toggle")
+async def qh_toggle(callback: CallbackQuery) -> None:
+    await toggle_quiet_hours_enabled(callback.from_user.id)
+    await _render_qh_screen(callback, "Обновлено ✅")
+
+
+@router.callback_query(F.data.startswith("qhs_adj:"))
+async def qhs_adjust(callback: CallbackQuery) -> None:
+    """Степпер НАЧАЛА окна (см. database.requests.adjust_quiet_hours_start)."""
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    await adjust_quiet_hours_start(callback.from_user.id, delta)
+    await _render_qh_screen(callback)
+
+
+@router.callback_query(F.data.startswith("qhe_adj:"))
+async def qhe_adjust(callback: CallbackQuery) -> None:
+    """Степпер КОНЦА окна (см. database.requests.adjust_quiet_hours_end)."""
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    await adjust_quiet_hours_end(callback.from_user.id, delta)
+    await _render_qh_screen(callback)
+
+
+# --- Экран "🛒 Напоминание о покупках" -------------------------------------------
+
+async def _render_shprmd_screen(callback: CallbackQuery, toast: str | None = None) -> None:
+    user = await get_or_create_user(user_id=callback.from_user.id, username=callback.from_user.username)
+    if toast is not None:
+        await callback.answer(toast)
+    else:
+        await callback.answer()
+    await callback.message.edit_text(
+        texts.shopping_reminder_settings_text(
+            user.shopping_reminder_enabled, user.shopping_reminder_weekday, user.shopping_reminder_time_minutes
+        ),
+        reply_markup=shopping_reminder_screen_keyboard(
+            user.shopping_reminder_enabled, user.shopping_reminder_weekday, user.shopping_reminder_time_minutes
+        ).as_markup(),
+    )
+
+
+@router.callback_query(F.data == "shprmd_open")
+async def shprmd_open(callback: CallbackQuery) -> None:
+    """"🛒 Напоминание о покупках" в "🔔 Уведомления" — новая, по умолчанию
+    выключенная еженедельная фича: переключатель + день недели + степпер
+    времени (см. keyboards.shopping_reminder_screen_keyboard)."""
+    await _render_shprmd_screen(callback)
+
+
+@router.callback_query(F.data == "shprmd_toggle")
+async def shprmd_toggle(callback: CallbackQuery) -> None:
+    await toggle_shopping_reminder_enabled(callback.from_user.id)
+    await _render_shprmd_screen(callback, "Обновлено ✅")
+
+
+@router.callback_query(F.data.startswith("shday_set:"))
+async def shprmd_day(callback: CallbackQuery) -> None:
+    """Выбор дня недели (радио-кнопки Пн–Вс, см.
+    database.requests.set_shopping_reminder_weekday)."""
+    weekday = int(callback.data.split(":", maxsplit=1)[1])
+    await set_shopping_reminder_weekday(callback.from_user.id, weekday)
+    await _render_shprmd_screen(callback)
+
+
+@router.callback_query(F.data.startswith("shtime_adj:"))
+async def shprmd_adjust(callback: CallbackQuery) -> None:
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    await adjust_shopping_reminder_time(callback.from_user.id, delta)
+    await _render_shprmd_screen(callback)
 
 
 # --- Экран "⏱ Стандартные пресеты напоминаний" (Time Management Module v2) ----
