@@ -12,11 +12,13 @@ from datetime import date
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from database.models import Priority, ReminderOffset
+from database.models import Priority, RecurrenceRule, ReminderOffset, TaskCategory
 from services.leveling import XP_BY_PRIORITY, XP_PER_TASK
 from texts import (
+    CATEGORY_LABELS,
     PRIORITY_LABELS,
     PRIORITY_MARKERS,
+    RECURRENCE_LABELS,
     REMINDER_OFFSET_LABELS,
     URGENCY_MARKERS,
     button_deadline_suffix,
@@ -266,14 +268,28 @@ def _task_button_label(task, viewer_user_id: int | None = None) -> str:
 
 
 # Вкладки-фильтры над списком "📋 Мои задачи" (см. tasks_page_keyboard) —
-# показываются только тем, у кого есть привязанный партнёр (иначе "Мои"/
-# "Общие" ничего бы не значили). "Мои" — строго личные (не общие) задачи
-# самого viewer'а, "Общие" — все общие сразу (свои общие + партнёрские),
-# без пересечений с "Мои", так что "Мои" + "Общие" всегда равно "Все".
+# ВСЕГДА показываются всем, независимо от партнёрского статуса: категории
+# ("Категории задач") не про то, чьё это дело, а про ЧТО за дело — в
+# отличие от прежних "Мои"/"Общие" (которые имели смысл только при
+# наличии партнёра), эти вкладки одинаково полезны и без партнёра вовсе.
+# Общие задачи партнёра просто ВИДНЫ внутри каждой вкладки (см.
+# texts.tasks_list_text — группировка "Личное"/"Общее" внутри списка), а
+# не вынесены в отдельную вкладку "Партнёр" — так решила пользовательница.
+#
+# .value TaskCategory используются напрямую как ключи вкладок — см.
+# database.models.TaskCategory, отдельная мапа не нужна.
 TASKS_FILTER_ALL = "all"
-TASKS_FILTER_MINE = "mine"
-TASKS_FILTER_SHARED = "shared"
-_TASKS_FILTER_TABS = ((TASKS_FILTER_ALL, "📋 Все"), (TASKS_FILTER_MINE, "👤 Мои"), (TASKS_FILTER_SHARED, "👥 Общие"))
+TASKS_FILTER_PURCHASES = TaskCategory.purchases.value
+TASKS_FILTER_PAYMENTS = TaskCategory.payments.value
+TASKS_FILTER_VISITS = TaskCategory.visits.value
+TASKS_FILTER_CHORES = TaskCategory.chores.value
+_TASKS_FILTER_TABS = (
+    (TASKS_FILTER_ALL, "📋 Все"),
+    (TASKS_FILTER_PURCHASES, "🛒 Покупки"),
+    (TASKS_FILTER_PAYMENTS, "💳 Оплата"),
+    (TASKS_FILTER_VISITS, "🏥 Визиты"),
+    (TASKS_FILTER_CHORES, "🧹 Дела"),
+)
 
 
 def tasks_page_keyboard(
@@ -281,7 +297,6 @@ def tasks_page_keyboard(
     offset: int,
     viewer_user_id: int | None = None,
     task_filter: str = TASKS_FILTER_ALL,
-    show_filter_tabs: bool = False,
     filter_counts: dict | None = None,
 ) -> tuple[InlineKeyboardBuilder, int]:
     """
@@ -294,9 +309,9 @@ def tasks_page_keyboard(
     вызывающим кодом (handlers/tasks.py), сюда приходит готовый список.
 
     viewer_user_id — см. _task_button_label (маркер 👥 у общих задач партнёра).
-    show_filter_tabs/filter_counts — вкладки "Все/Мои/Общие" сверху (см.
-    _TASKS_FILTER_TABS); filter_counts — словарь {"all": n, "mine": n,
-    "shared": n} для подписи с числом на каждой вкладке.
+    Вкладки категорий (см. _TASKS_FILTER_TABS) показываются ВСЕГДА, не
+    только при наличии партнёра — filter_counts — словарь {"all": n,
+    "purchases": n, ...} для подписи с числом на каждой вкладке.
 
     Открытие карточки задачи (card_open) НЕ запоминает текущий фильтр —
     "◀️ Назад к списку" из карточки всегда возвращает на "Все" (см.
@@ -313,13 +328,14 @@ def tasks_page_keyboard(
     builder = InlineKeyboardBuilder()
     row_sizes = []
 
-    if show_filter_tabs:
-        counts = filter_counts or {}
-        for key, label in _TASKS_FILTER_TABS:
-            n = counts.get(key, 0)
-            text = f"• {label} ({n})" if key == task_filter else f"{label} ({n})"
-            builder.button(text=text, callback_data=f"tasks_page:0:{key}")
-        row_sizes.append(len(_TASKS_FILTER_TABS))
+    counts = filter_counts or {}
+    for key, label in _TASKS_FILTER_TABS:
+        n = counts.get(key, 0)
+        text = f"• {label} ({n})" if key == task_filter else f"{label} ({n})"
+        builder.button(text=text, callback_data=f"tasks_page:0:{key}")
+    # 5 вкладок в один ряд были бы слишком узкими на телефоне — переносим
+    # "Все" отдельной строкой сверху, остальные четыре — в один ряд ниже.
+    row_sizes.extend([1, 4])
 
     for task in page:
         builder.button(
@@ -713,6 +729,8 @@ def task_card_keyboard(
     in_checklist_today: bool,
     is_shared: bool = False,
     can_toggle_shared: bool = False,
+    category: TaskCategory = TaskCategory.chores,
+    recurrence_rule: RecurrenceRule = RecurrenceRule.none,
 ) -> InlineKeyboardBuilder:
     """
     Кнопки управления карточкой задачи (открывается кликом по задаче в
@@ -733,17 +751,31 @@ def task_card_keyboard(
     "быть общими", может только сам владелец (см.
     database.requests.toggle_task_shared). is_shared — текущее состояние
     этого конкретного переключателя (Task.shared), решает подпись кнопки.
+
+    category — открывает выбор категории (см. category_picker_keyboard,
+    handlers/tasks.py::card_category). recurrence_rule — кнопка "🔁 Повтор"
+    показывается ТОЛЬКО для категории "💳 Оплата" (см.
+    category_picker_keyboard/recurrence_picker_keyboard) — остальным
+    категориям автоповтор пока недоступен, см. решение "Сразу с
+    автоповтором" по итогам обсуждения категорий задач.
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить текст", callback_data=f"card_edittext:{task_id}")
     builder.button(text="📅 Изменить дату / время", callback_data=f"card_editdl:{task_id}")
     builder.button(text="🔔 Настроить напоминания", callback_data=f"card_remind:{task_id}")
+    builder.button(text=f"🗂 Категория: {CATEGORY_LABELS[category]}", callback_data=f"card_category:{task_id}")
+    row_sizes = [1, 1, 1, 1]
+
+    if category == TaskCategory.payments:
+        builder.button(text=f"🔁 Повтор: {RECURRENCE_LABELS[recurrence_rule]}", callback_data=f"card_recur:{task_id}")
+        row_sizes.append(1)
+
     if in_checklist_today:
         builder.button(text="🌙 Убрать из Чек-листа дня", callback_data=f"card_chk_out:{task_id}")
     else:
         builder.button(text="☀️ Включить в Чек-лист дня", callback_data=f"card_chk_in:{task_id}")
+    row_sizes.append(1)
 
-    row_sizes = [1, 1, 1, 1]
     if can_toggle_shared:
         toggle_label = "🔒 Сделать личной" if is_shared else "👥 Сделать общей с партнёром"
         builder.button(text=toggle_label, callback_data=f"card_toggle_shared:{task_id}")
@@ -755,6 +787,33 @@ def task_card_keyboard(
     builder.button(text="◀️ Назад к списку", callback_data=f"tasks_page:{offset}:all")
     row_sizes += [1, 1]
     builder.adjust(*row_sizes)
+    return builder
+
+
+def category_picker_keyboard(task_id: int, current: TaskCategory) -> InlineKeyboardBuilder:
+    """Экран выбора категории задачи (карточка → "🗂 Категория: …", см.
+    handlers/tasks.py::card_category/cat_set) — текущая категория отмечена
+    точкой, как и везде в этом файле (см. _TASKS_FILTER_TABS)."""
+    builder = InlineKeyboardBuilder()
+    for cat in TaskCategory:
+        label = CATEGORY_LABELS[cat]
+        text = f"• {label}" if cat == current else label
+        builder.button(text=text, callback_data=f"cat_set:{task_id}:{cat.value}")
+    builder.button(text="◀️ Отмена", callback_data=f"cat_cancel:{task_id}")
+    builder.adjust(1, 1, 1, 1, 1)
+    return builder
+
+
+def recurrence_picker_keyboard(task_id: int, current: RecurrenceRule) -> InlineKeyboardBuilder:
+    """Экран выбора автоповтора задачи (карточка → "🔁 Повтор: …", только
+    для категории "💳 Оплата", см. handlers/tasks.py::card_recur/recur_set)."""
+    builder = InlineKeyboardBuilder()
+    for rule in RecurrenceRule:
+        label = RECURRENCE_LABELS[rule]
+        text = f"• {label}" if rule == current else label
+        builder.button(text=text, callback_data=f"recur_set:{task_id}:{rule.value}")
+    builder.button(text="◀️ Отмена", callback_data=f"recur_cancel:{task_id}")
+    builder.adjust(1, 1, 1, 1, 1)
     return builder
 
 

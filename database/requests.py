@@ -7,13 +7,25 @@
 переедем на PostgreSQL), хендлеры менять не придётся.
 """
 
+import calendar
 import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from sqlalchemy import func, or_, select, update
 
-from database.models import Habit, Priority, Reminder, ReminderOffset, Status, Task, User, async_session
+from database.models import (
+    Habit,
+    Priority,
+    RecurrenceRule,
+    Reminder,
+    ReminderOffset,
+    Status,
+    Task,
+    TaskCategory,
+    User,
+    async_session,
+)
 
 
 async def get_or_create_user(user_id: int, username: str | None) -> User:
@@ -30,14 +42,20 @@ async def get_or_create_user(user_id: int, username: str | None) -> User:
         return user
 
 
-async def add_task(user_id: int, title: str) -> Task:
+async def add_task(user_id: int, title: str, category: TaskCategory = TaskCategory.chores) -> Task:
     """
     Создаёт новую задачу для пользователя со статусом "в процессе".
     Приоритет по умолчанию — Medium (его можно будет менять на
     следующих шагах, например, через отдельную команду).
+
+    category — категория задачи (см. database.models.TaskCategory,
+    вкладки "Покупки/Оплата/Визиты/Дела" в /tasks). По умолчанию
+    "Дела" — вызывающий код (handlers/tasks.py::_create_task_with_ai)
+    передаёт сюда результат ИИ-разбора (ParsedTask.category), когда он
+    доступен, иначе задача остаётся в самой нейтральной категории.
     """
     async with async_session() as session:
-        task = Task(user_id=user_id, title=title, status=Status.in_progress)
+        task = Task(user_id=user_id, title=title, status=Status.in_progress, category=category)
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -1068,6 +1086,113 @@ async def toggle_task_shared(task_id: int, user_id: int) -> Task | None:
         await session.commit()
         await session.refresh(task)
         return task
+
+
+async def set_task_category(task_id: int, user_id: int, category: TaskCategory) -> bool:
+    """
+    Меняет категорию задачи (карточка задачи → "🗂 Категория", см.
+    handlers/tasks.py::card_category/cat_set). Категория — не вопрос
+    владения, поэтому доступ — через _authorized_task (владелец ИЛИ
+    партнёр по общей задаче, как и set_task_deadline/set_task_priority),
+    а не только сам владелец.
+    """
+    async with async_session() as session:
+        task = await _authorized_task(session, task_id, user_id)
+        if task is None:
+            return False
+        task.category = category
+        await session.commit()
+        return True
+
+
+async def set_task_recurrence(task_id: int, user_id: int, rule: RecurrenceRule) -> bool:
+    """
+    Включает/меняет/выключает автоповтор задачи (карточка задачи → "🔁
+    Повтор", доступно только категории "💳 Оплата", см.
+    handlers/tasks.py::card_recur/recur_set). Доступ — через
+    _authorized_task, как и у set_task_category.
+    """
+    async with async_session() as session:
+        task = await _authorized_task(session, task_id, user_id)
+        if task is None:
+            return False
+        task.recurrence_rule = rule
+        await session.commit()
+        return True
+
+
+def _advance_deadline_by_rule(deadline: datetime, rule: RecurrenceRule) -> datetime:
+    """
+    Сдвигает дедлайн на следующий период автоповтора, отталкиваясь от
+    СТАРОГО дедлайна (а не от момента фактического закрытия задачи) — так
+    регулярный платёж по фиксированному расписанию (аренда 1-го числа,
+    подписка каждую пятницу) не "уезжает" вперёд, даже если сама задача
+    была закрыта на день-два позже срока.
+
+    weekly — просто +7 дней, тут нечего усложнять.
+
+    monthly/yearly — календарно-аккуратный сдвиг: если в целевом месяце
+    столько чисел нет (например, 31 января + месяц → в феврале нет 31-го),
+    берём последний ДЕЙСТВИТЕЛЬНО существующий день этого месяца (28 или
+    29 февраля), а не падаем с ValueError и не "перескакиваем" в март.
+    calendar.monthrange(year, month)[1] — как раз количество дней в месяце
+    с учётом високосного года.
+    """
+    if rule == RecurrenceRule.weekly:
+        return deadline + timedelta(days=7)
+
+    if rule == RecurrenceRule.monthly:
+        year = deadline.year + (deadline.month // 12)
+        month = deadline.month % 12 + 1
+    elif rule == RecurrenceRule.yearly:
+        year = deadline.year + 1
+        month = deadline.month
+    else:
+        # RecurrenceRule.none — сюда попадать не должны (вызывающий код
+        # проверяет rule != none заранее), но на всякий случай не падаем,
+        # а просто возвращаем дедлайн как есть.
+        return deadline
+
+    last_day_of_month = calendar.monthrange(year, month)[1]
+    day = min(deadline.day, last_day_of_month)
+    return deadline.replace(year=year, month=month, day=day)
+
+
+async def spawn_next_recurrence(task: Task) -> Task | None:
+    """
+    Создаёт следующую задачу-повтор при закрытии задачи с recurrence_rule
+    != none (вызывается из services.task_actions.complete_task_core СРАЗУ
+    после успешного mark_task_done — старая задача остаётся выполненной и
+    никуда не девается, это отдельная НОВАЯ запись, а не "перезапуск" той
+    же самой). Копирует название/приоритет/категорию/общность/правило
+    повтора как есть, дедлайн сдвигает через _advance_deadline_by_rule.
+
+    Возвращает None, если у задачи вообще нет дедлайна — сдвигать
+    буквально нечего (в UI кнопка автоповтора и не должна была быть
+    доступна без дедлайна, но проверяем и здесь на всякий случай, а не
+    полагаемся только на UI).
+    """
+    if task.deadline is None:
+        return None
+
+    new_deadline = _advance_deadline_by_rule(task.deadline, task.recurrence_rule)
+
+    async with async_session() as session:
+        new_task = Task(
+            user_id=task.user_id,
+            title=task.title,
+            priority=task.priority,
+            status=Status.in_progress,
+            deadline=new_deadline,
+            deadline_all_day=task.deadline_all_day,
+            shared=task.shared,
+            category=task.category,
+            recurrence_rule=task.recurrence_rule,
+        )
+        session.add(new_task)
+        await session.commit()
+        await session.refresh(new_task)
+        return new_task
 
 
 async def get_task_reminders(task_id: int) -> list[Reminder]:

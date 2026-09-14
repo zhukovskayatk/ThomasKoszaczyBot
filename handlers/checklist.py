@@ -207,6 +207,14 @@ async def chk_ttoggle(callback: CallbackQuery) -> None:
         except TelegramBadRequest:
             pass
 
+    if result.recurring_next_deadline is not None:
+        # Регулярный платёж, закрытый прямо из чек-листа дня — та же
+        # приписка, что и у обычного закрытия задачи (см.
+        # handlers/tasks.py::complete_task).
+        offset_minutes = await timeutils.viewer_offset_minutes(callback.from_user.id)
+        local_next = timeutils.to_user(result.recurring_next_deadline, offset_minutes)
+        await callback.message.answer(texts.recurring_task_created_text(result.task_title, local_next))
+
     text, keyboard = await _dashboard_payload(callback.from_user.id)
     await callback.message.edit_text(text, reply_markup=keyboard)
 

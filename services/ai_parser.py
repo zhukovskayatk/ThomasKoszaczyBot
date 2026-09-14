@@ -26,7 +26,7 @@ from datetime import datetime
 import aiohttp
 
 from config import settings
-from database.models import Priority
+from database.models import Priority, TaskCategory
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,18 @@ _PRIORITY_BY_CODE = {
     "low": Priority.low,
     "medium": Priority.medium,
     "high": Priority.high,
+}
+
+# Категории задач (см. database.models.TaskCategory) — коды в промпте ИИ
+# намеренно короткие английские слова, а не .value (которые тоже
+# английские, просто на всякий случай не завязываемся на них напрямую, а
+# держим отдельную явную мапу — как и с _PRIORITY_BY_CODE выше). Ничего не
+# найдено/не подошло — chores, самая нейтральная категория по умолчанию.
+_CATEGORY_BY_CODE = {
+    "purchases": TaskCategory.purchases,
+    "payments": TaskCategory.payments,
+    "visits": TaskCategory.visits,
+    "chores": TaskCategory.chores,
 }
 
 
@@ -82,6 +94,12 @@ class ParsedTask:
     # будто его не было: партнёрский режим в самом ai_parser не проверяем
     # намеренно, это забота вызывающего кода, а не разбора текста.
     is_shared: bool
+    # Категория задачи (см. database.models.TaskCategory) — автоматическая
+    # разбивка по вкладкам "Покупки/Оплата/Визиты/Дела" (см. _system_prompt
+    # ниже и _CATEGORY_BY_CODE выше). Всегда какое-то значение (никогда
+    # None) — по умолчанию TaskCategory.chores, если ИИ не смог уверенно
+    # отнести задачу ни к одной из трёх более специфичных категорий.
+    category: TaskCategory
 
 
 def _system_prompt(now: datetime) -> str:
@@ -109,6 +127,15 @@ def _system_prompt(now: datetime) -> str:
         "партнёром\", \"общая задача\" — иначе false. Не угадывай по смыслу "
         "дела (\"купить корм котам\" — это НЕ автоматически общее, только "
         "если так и сказано словами).\n"
+        '  "category": одно из "purchases", "payments", "visits", '
+        '"chores" — категория дела:\n'
+        '    "purchases" — купить что-то (продукты, вещи, товары);\n'
+        '    "payments" — оплатить что-то (подписка, кредит, ипотека, '
+        "аренда, счета, коммуналка);\n"
+        '    "visits" — визит куда-то (врач, салон, гос. учреждение, '
+        "приём, встреча по записи);\n"
+        '    "chores" — всё остальное (уборка, дела по дому, разное) — '
+        "используй это значение, если не уверен.\n"
         "}\n\n"
         "Относительные даты (\"завтра\", \"в пятницу\", \"через 2 часа\") "
         "переводи в абсолютную дату относительно текущего момента выше."
@@ -182,8 +209,12 @@ async def parse_task_message(text: str, now: datetime | None = None) -> ParsedTa
         all_day = bool(parsed.get("all_day")) and deadline is not None
         priority = _PRIORITY_BY_CODE.get(parsed.get("priority"))
         is_shared = bool(parsed.get("is_shared"))
+        category = _CATEGORY_BY_CODE.get(parsed.get("category"), TaskCategory.chores)
 
-        return ParsedTask(title=title, deadline=deadline, all_day=all_day, priority=priority, is_shared=is_shared)
+        return ParsedTask(
+            title=title, deadline=deadline, all_day=all_day, priority=priority,
+            is_shared=is_shared, category=category,
+        )
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
         logger.exception("Не удалось разобрать ответ DeepSeek: %r", data)
         return None

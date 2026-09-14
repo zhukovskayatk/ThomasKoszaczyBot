@@ -18,7 +18,7 @@ import random
 from datetime import date, datetime, timedelta
 from html import escape as _escape
 
-from database.models import Priority, ReminderOffset
+from database.models import Priority, RecurrenceRule, ReminderOffset, TaskCategory
 from services.leveling import LevelInfo, XP_BY_PRIORITY, XP_PER_TASK, build_progress_bar
 
 # Подписи приоритета в формате "Слово + эмодзи" — используются везде,
@@ -34,6 +34,28 @@ PRIORITY_LABELS = {
     # уже свершившееся состояние в карточке), поэтому не переиспользуем
     # один и тот же текст для обоих мест.
     Priority.none: "Обычный ⚪️",
+}
+
+# Подписи категорий задач (см. database.models.TaskCategory) — используются
+# и в кнопке карточки "🗂 Категория: …" (см. keyboards.task_card_keyboard/
+# category_picker_keyboard), и в заголовках вкладок списка задач ниже (см.
+# _TASKS_FILTER_TITLES). Порядок объявления Enum'а — порядок кнопок на
+# экране выбора категории.
+CATEGORY_LABELS = {
+    TaskCategory.purchases: "🛒 Покупки",
+    TaskCategory.payments: "💳 Оплата",
+    TaskCategory.visits: "🏥 Визиты",
+    TaskCategory.chores: "🧹 Дела",
+}
+
+# Подписи автоповтора (см. database.models.RecurrenceRule) — кнопка карточки
+# "🔁 Повтор: …" (только категория "💳 Оплата", см.
+# keyboards.recurrence_picker_keyboard).
+RECURRENCE_LABELS = {
+    RecurrenceRule.none: "Без повтора",
+    RecurrenceRule.weekly: "Каждую неделю",
+    RecurrenceRule.monthly: "Каждый месяц",
+    RecurrenceRule.yearly: "Каждый год",
 }
 
 # Подписи вариантов напоминания — используются в меню мультивыбора
@@ -115,10 +137,6 @@ _MONTHS_SHORT_RU = {
 # независимая от приоритета иконка-тема (часы), а кружки 🔴🟡🟢 остаются
 # строго за приоритетом (см. PRIORITY_MARKERS/PRIORITY_LABELS ниже).
 URGENCY_MARKERS = {0: "🔥", 1: "⏳", 2: "🌱"}
-
-# Заголовки блоков-групп списка задач (см. tasks_list_text) — та же
-# срочность, что и URGENCY_MARKERS, просто с подписью для дашборда.
-_GROUP_TITLES = {0: "Горят сегодня", 1: "Ближайшие", 2: "В бэклоге"}
 
 # Только цветной кружок приоритета, без слова — используется в строке-
 # буллете списка задач (см. _list_bullet_line), где рядом уже есть текст
@@ -575,44 +593,56 @@ def _list_bullet_line(task, viewer_user_id: int | None = None) -> str:
     return f"• {partner_marker}<b>{escape(task.title)}</b>{_list_bullet_detail(task)} {PRIORITY_MARKERS[task.priority]}"
 
 
+# Заголовки вкладок списка задач (см. keyboards.TASKS_FILTER_*) — категории
+# ЗАМЕНИЛИ прежние "Мои"/"Общие" (см. tasks_list_text ниже — деление по
+# владельцу "Личное"/"Общее" теперь работает ВНУТРИ каждой вкладки, а не
+# как отдельная вкладка).
 _TASKS_FILTER_TITLES = {
-    "mine": "👤 <b>ТВОИ ЛИЧНЫЕ ЗАДАЧИ</b>",
-    "shared": "👥 <b>ОБЩИЕ ЗАДАЧИ</b>",
+    "all": "📋 <b>ВСЕ ЗАДАЧИ</b>",
+    "purchases": "🛒 <b>ПОКУПКИ</b>",
+    "payments": "💳 <b>ОПЛАТА</b>",
+    "visits": "🏥 <b>ВИЗИТЫ</b>",
+    "chores": "🧹 <b>ДЕЛА</b>",
+}
+
+_NO_TASKS_IN_FILTER_TEXTS = {
+    "purchases": "🛒 Покупок пока нет — самое время добавить первую!",
+    "payments": "💳 Платежей пока нет — добавь подписку, кредит или аренду.",
+    "visits": "🏥 Визитов пока нет.",
+    "chores": "🧹 Дел пока нет.",
 }
 
 
 def no_tasks_in_filter_text(task_filter: str) -> str:
-    """Пустая вкладка фильтра списка задач (обычно "Общие", пока ничего не
-    сделано общим) — отдельно от no_active_tasks_text(), т.к. активные
-    задачи вообще-то есть, просто не в этой вкладке."""
-    if task_filter == "shared":
-        return "👥 Общих задач пока нет — отметь что-нибудь общим прямо в карточке задачи."
-    return "👤 Личных задач пока нет — все текущие уже общие с партнёром."
+    """Пустая вкладка категории списка задач — отдельно от
+    no_active_tasks_text(), т.к. активные задачи вообще-то есть, просто не
+    в этой конкретной категории."""
+    return _NO_TASKS_IN_FILTER_TEXTS.get(task_filter, "Задач в этой категории пока нет.")
 
 
 def tasks_list_text(tasks: list, viewer_user_id: int | None = None, task_filter: str | None = None) -> str:
     """
-    Список задач как компактный дашборд. tasks — уже ОТФИЛЬТРОВАННЫЙ (если
-    task_filter задан) список активных задач (не только текущая страница) —
-    в отличие от инлайн-кнопок под сообщением (см.
+    Список задач как компактный дашборд. tasks — уже ОТФИЛЬТРОВАННЫЙ (по
+    категории, если task_filter задан) список активных задач (не только
+    текущая страница) — в отличие от инлайн-кнопок под сообщением (см.
     keyboards.tasks_page_keyboard), которые показывают только одну
     страницу, текст всегда даёт целостную картину по текущей вкладке.
 
-    Два варианта группировки внутри:
-    - вкладка "all" у пары (виден и свой, и партнёрский список сразу) —
-      делим на "👤 Мои дела" и "🔥 Ближайшие общие дела" по ВЛАДЕЛЬЦУ, а не
-      по срочности: смешанный список без разделения по человеку — то,
-      из-за чего общие дела партнёра терялись между своими, отсюда и
-      просьба разделить наглядно (см. task_filter == "all" ниже).
-    - все остальные случаи (нет партнёра, либо уже отфильтровано на вкладке
-      "Мои"/"Общие" — там и так один владелец) — старая группировка по
-      срочности (см. task_urgency_category): 🔥 горят сегодня → ⏳
-      ближайшие → 🌱 бэклог.
+    Группировка внутри — ОДНА и та же для ЛЮБОЙ вкладки (в отличие от
+    прежней версии, где по владельцу делилась только "Все", а остальные —
+    по срочности): "👤 Личное" — задачи самого viewer'а, "👥 Общее" — все
+    общие сразу (свои общие + партнёрские), сначала личное, потом общее
+    (как и попросила пользовательница — "в каждой сфере идёт в начале
+    личное, а потом общее"). Порядок ВНУТРИ каждой группы не меняется —
+    сортировка по срочности уже сделана раньше (get_active_tasks_by_deadline),
+    а сама срочность по-прежнему видна на каждой строке-булите (см.
+    _list_bullet_detail) — отдельный заголовок-группировка по огню/бэклогу
+    (старые 🔥 Горят сегодня/⏳ Ближайшие/🌱 В бэклоге) поэтому больше не
+    нужна и ничего не теряет.
 
     viewer_user_id — см. _list_bullet_line (маркер 👥 у общих задач партнёра).
-    task_filter — "mine"/"shared" меняют заголовок под текущую вкладку
-    (см. keyboards.TASKS_FILTER_*); None — обычный заголовок, как было
-    раньше для всех, у кого нет партнёра.
+    task_filter — меняет заголовок под текущую вкладку (см.
+    keyboards.TASKS_FILTER_*); None/незнакомое значение — обычный заголовок.
     """
     if not tasks:
         return no_active_tasks_text()
@@ -620,28 +650,20 @@ def tasks_list_text(tasks: list, viewer_user_id: int | None = None, task_filter:
     title = _TASKS_FILTER_TITLES.get(task_filter, "📋 <b>ТВОИ ЗАДАЧИ</b>")
     blocks = [title, _DIVIDER]
 
-    if task_filter == "all" and viewer_user_id is not None:
+    if viewer_user_id is not None:
         mine = [t for t in tasks if t.user_id == viewer_user_id and not t.shared]
         shared = [t for t in tasks if t.shared]
         if mine:
-            blocks.append("👤 <b>Мои дела:</b>")
+            blocks.append("👤 <b>Личное:</b>")
             blocks.extend(_list_bullet_line(task, viewer_user_id) for task in mine)
             blocks.append("")
         if shared:
-            blocks.append("🔥 <b>Ближайшие общие дела:</b>")
+            blocks.append("👥 <b>Общее:</b>")
             blocks.extend(_list_bullet_line(task, viewer_user_id) for task in shared)
             blocks.append("")
     else:
-        grouped: dict[int, list] = {0: [], 1: [], 2: []}
-        for task in tasks:
-            grouped[task_urgency_category(task)].append(task)
-        for category in (0, 1, 2):
-            group_tasks = grouped[category]
-            if not group_tasks:
-                continue
-            blocks.append(f"{URGENCY_MARKERS[category]} <b>{_GROUP_TITLES[category]}:</b>")
-            blocks.extend(_list_bullet_line(task, viewer_user_id) for task in group_tasks)
-            blocks.append("")
+        blocks.extend(_list_bullet_line(task) for task in tasks)
+        blocks.append("")
 
     if blocks[-1] == "":
         blocks.pop()
@@ -1365,7 +1387,10 @@ def task_card_text(task, reminders, shared_by_partner: bool = False) -> str:
     lines += [
         _DIVIDER,
         f"⚡️ <b>Приоритет:</b> {PRIORITY_LABELS[task.priority]}",
+        f"🗂 <b>Категория:</b> {CATEGORY_LABELS[task.category]}",
     ]
+    if task.recurrence_rule != RecurrenceRule.none:
+        lines.append(f"🔁 <b>Повтор:</b> {RECURRENCE_LABELS[task.recurrence_rule]}")
 
     if task.deadline is None:
         lines.append(f"⏳ <b>Дедлайн:</b> без срока {urgency_marker}")
@@ -1381,3 +1406,30 @@ def task_card_text(task, reminders, shared_by_partner: bool = False) -> str:
 
     lines.append(_DIVIDER)
     return "\n".join(lines)
+
+
+# --- Категории задач + автоповтор для "Оплаты" ---------------------------------
+
+def category_picker_prompt_text(task_title: str) -> str:
+    """Экран выбора категории (карточка задачи → "🗂 Категория: …", см.
+    keyboards.category_picker_keyboard)."""
+    return f"🗂 В какую категорию отнести «{escape(task_title)}»?"
+
+
+def recurrence_picker_prompt_text(task_title: str) -> str:
+    """Экран выбора автоповтора (карточка задачи → "🔁 Повтор: …", только
+    категория "💳 Оплата", см. keyboards.recurrence_picker_keyboard)."""
+    return f"🔁 Как часто повторять «{escape(task_title)}»?"
+
+
+def recurring_task_created_text(task_title: str, next_deadline: datetime) -> str:
+    """
+    Короткая приписка после закрытия регулярного платежа (категория
+    "💳 Оплата" с автоповтором) — сообщает, что на смену закрытой задаче
+    уже создана следующая, и когда у неё срок (см.
+    services.task_actions.complete_task_core/spawn_next_recurrence,
+    handlers/tasks.py::complete_task, handlers/checklist.py::chk_ttoggle).
+    next_deadline уже должен быть переведён в ЛИЧНЫЙ часовой пояс того, кто
+    закрыл задачу (см. services/timeutils.py) — здесь только форматирование.
+    """
+    return f"🔁 Готово! Следующий платёж «{escape(task_title)}» — {format_deadline(next_deadline, False)}."

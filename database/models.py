@@ -120,6 +120,41 @@ class ReminderOffset(str, enum.Enum):
     custom = "custom"
 
 
+class TaskCategory(str, enum.Enum):
+    """
+    Категория задачи (раздел "Категории задач", вкладки в /tasks).
+
+    .value используется напрямую как ключ вкладки-фильтра в keyboards.py
+    (замена прежних TASKS_FILTER_MINE/TASKS_FILTER_SHARED) и как часть
+    callback_data кнопки выбора категории — отдельная мапа не нужна.
+    chores ("Дела") — категория по умолчанию: если ИИ не смог уверенно
+    отнести задачу ни к одной из трёх более специфичных категорий, она
+    остаётся здесь, а не теряется и не требует обязательного выбора руками.
+    """
+    purchases = "purchases"  # 🛒 Покупки — список продуктов/вещей
+    payments = "payments"  # 💳 Оплата — подписки, кредиты, ипотека (+ автоповтор)
+    visits = "visits"  # 🏥 Визиты — врач, ногти, гос. органы
+    chores = "chores"  # 🧹 Дела — всё остальное (по умолчанию)
+
+
+class RecurrenceRule(str, enum.Enum):
+    """
+    Правило автоповтора задачи при её выполнении (см.
+    services.task_actions.complete_task_core → spawn_next_recurrence).
+
+    Пока используется только категорией "💳 Оплата" (подписки/кредиты/
+    аренда — им и нужен реальный автоповтор), но поле общее на Task, а не
+    привязано к категории жёстко — так его можно будет включить и для
+    других категорий позже, не трогая модель ещё раз. none — обычная
+    неповторяющаяся задача, значение по умолчанию (поведение не меняется
+    для всех уже существующих задач).
+    """
+    none = "none"
+    weekly = "weekly"
+    monthly = "monthly"
+    yearly = "yearly"
+
+
 # --- Таблица пользователей ---------------------------------------------------
 
 class User(Base):
@@ -304,6 +339,26 @@ class Task(Base):
     # за другого, каким его задачам "быть общими".
     shared: Mapped[bool] = mapped_column(default=False)
 
+    # --- Категории задач + автоповтор для "Оплаты" ---------------------------
+    # category — раздел, в котором задача показывается на вкладках /tasks
+    # (см. TaskCategory выше). Выставляется либо ИИ-разбором текста/голоса
+    # (services.ai_parser.ParsedTask.category), либо вручную кнопкой в
+    # карточке задачи (database.requests.set_task_category). По умолчанию
+    # "Дела" — самая нейтральная категория для задач без дедлайна/деталей,
+    # которые раньше вообще не категоризировались.
+    category: Mapped[TaskCategory] = mapped_column(
+        SAEnum(TaskCategory, native_enum=False), default=TaskCategory.chores
+    )
+
+    # recurrence_rule — правило автоповтора (см. RecurrenceRule выше). При
+    # завершении задачи с recurrence_rule != none (services.task_actions.
+    # complete_task_core) автоматически создаётся следующая задача с тем же
+    # названием/категорией и сдвинутым дедлайном — старая просто помечается
+    # выполненной, отдельно от следующей. По умолчанию none — обычная задача.
+    recurrence_rule: Mapped[RecurrenceRule] = mapped_column(
+        SAEnum(RecurrenceRule, native_enum=False), default=RecurrenceRule.none
+    )
+
     user: Mapped["User"] = relationship(back_populates="tasks")
 
     # Связь "одна задача — много запланированных напоминаний". При удалении
@@ -481,6 +536,14 @@ async def _migrate_missing_columns(conn) -> None:
         await conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN completed_at DATETIME")
     if "shared" not in existing_task_columns:
         await conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN shared BOOLEAN NOT NULL DEFAULT 0")
+    if "category" not in existing_task_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN category TEXT NOT NULL DEFAULT 'chores'"
+        )
+    if "recurrence_rule" not in existing_task_columns:
+        await conn.exec_driver_sql(
+            "ALTER TABLE tasks ADD COLUMN recurrence_rule TEXT NOT NULL DEFAULT 'none'"
+        )
 
     # reminders — таблица появилась позже tasks/users; если она уже
     # существует (бот какое-то время работал ДО этого шага), а колонки

@@ -47,7 +47,7 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 
 import services.scheduler as scheduler_service
 import texts
-from database.models import Priority, ReminderOffset
+from database.models import Priority, RecurrenceRule, ReminderOffset, TaskCategory
 from database.requests import (
     REMINDER_OFFSET_DELTAS,
     add_reminder,
@@ -70,8 +70,10 @@ from database.requests import (
     recompute_reminders_for_new_deadline,
     register_ai_parse_usage,
     remove_reminder,
+    set_task_category,
     set_task_deadline,
     set_task_priority,
+    set_task_recurrence,
     set_task_shared,
     toggle_task_shared,
     update_task_title,
@@ -87,14 +89,14 @@ from keyboards import (
     QUICK_CLOSE_BUTTON_TEXT,
     TASKS_BUTTON_TEXT,
     TASKS_FILTER_ALL,
-    TASKS_FILTER_MINE,
-    TASKS_FILTER_SHARED,
     calendar_keyboard,
+    category_picker_keyboard,
     deadline_presets_keyboard,
     delete_confirm_keyboard,
     main_menu_keyboard,
     priority_keyboard,
     quick_close_session_keyboard,
+    recurrence_picker_keyboard,
     reminder_notification_keyboard,
     reminders_keyboard,
     shift_month,
@@ -196,43 +198,41 @@ async def _apply_default_reminders(
     return {reminder.offset for reminder in await get_task_reminders(task_id)}
 
 
-def _split_tasks_by_filter(tasks: list, viewer_user_id: int) -> dict:
+def _split_tasks_by_category(tasks: list) -> dict:
     """
     Раскладывает уже полученный список (get_active_tasks_by_deadline —
-    свои + общие партнёра) на три вкладки фильтра списка задач (см.
-    keyboards.TASKS_FILTER_*): "Мои" — строго личные (не общие) задачи
-    самого viewer'а, "Общие" — вообще все общие, свои и партнёрские сразу
-    (пересечения с "Мои" нет, так что "Мои" + "Общие" == "Все").
+    свои + общие партнёра) на вкладки-категории списка задач (см.
+    keyboards.TASKS_FILTER_*): "Все" — как есть, плюс по одной вкладке на
+    каждое значение database.models.TaskCategory. В отличие от прежних
+    "Мои"/"Общие" — деление ЧИСТО по категории, а не по владельцу; личное
+    и общее внутри одной категории показываются вместе, просто в разных
+    блоках текста (см. texts.tasks_list_text).
     """
-    mine = [t for t in tasks if t.user_id == viewer_user_id and not t.shared]
-    shared = [t for t in tasks if t.shared]
-    return {TASKS_FILTER_ALL: tasks, TASKS_FILTER_MINE: mine, TASKS_FILTER_SHARED: shared}
+    by_category: dict = {TASKS_FILTER_ALL: tasks}
+    for cat in TaskCategory:
+        by_category[cat.value] = [t for t in tasks if t.category == cat]
+    return by_category
 
 
-async def _tasks_view_payload(user_id: int, task_filter: str) -> tuple[list, bool, dict] | None:
+async def _tasks_view_payload(user_id: int, task_filter: str) -> tuple[list, dict] | None:
     """
     Общая подготовка данных для show_tasks/tasks_page: полный список +
-    (если есть партнёр) разбивку по вкладкам. Возвращает None, если
-    активных задач вообще нет — вызывающий код должен показать
-    no_active_tasks_text() и остановиться.
+    разбивку по вкладкам-категориям (см. _split_tasks_by_category).
+    Возвращает None, если активных задач вообще нет — вызывающий код
+    должен показать no_active_tasks_text() и остановиться.
 
-    show_filter_tabs=False для пользователей без партнёра — вкладки
-    "Мои"/"Общие" для них ничего бы не значили, список ведёт себя ровно
-    как раньше, без единой лишней кнопки.
+    Вкладки категорий показываются ВСЕГДА, независимо от партнёрского
+    статуса (в отличие от прежних "Мои"/"Общие", которые имели смысл
+    только при наличии партнёра) — категории не про то, чьё это дело.
     """
     tasks = await get_active_tasks_by_deadline(user_id=user_id)
     if not tasks:
         return None
 
-    partner = await get_partner(user_id)
-    show_filter_tabs = partner is not None
-    if not show_filter_tabs:
-        return tasks, False, {}
-
-    by_filter = _split_tasks_by_filter(tasks, user_id)
+    by_filter = _split_tasks_by_category(tasks)
     counts = {key: len(items) for key, items in by_filter.items()}
     filtered = by_filter.get(task_filter, tasks)
-    return filtered, True, counts
+    return filtered, counts
 
 
 async def show_tasks(message: Message, task_filter: str = TASKS_FILTER_ALL) -> None:
@@ -254,10 +254,10 @@ async def show_tasks(message: Message, task_filter: str = TASKS_FILTER_ALL) -> N
         await message.answer(texts.no_active_tasks_text(), reply_markup=main_menu_keyboard)
         return
 
-    filtered, show_filter_tabs, counts = payload
+    filtered, counts = payload
     if not filtered:
-        # Есть активные задачи вообще, но конкретная вкладка (обычно
-        # "Общие") пуста — отдельная реплика вместо пустого списка.
+        # Есть активные задачи вообще, но конкретная вкладка-категория
+        # пуста — отдельная реплика вместо пустого списка.
         await message.answer(texts.no_tasks_in_filter_text(task_filter), reply_markup=main_menu_keyboard)
         return
 
@@ -267,11 +267,10 @@ async def show_tasks(message: Message, task_filter: str = TASKS_FILTER_ALL) -> N
     timeutils.localize_tasks(filtered, await _user_offset(user_id))
 
     keyboard, offset = tasks_page_keyboard(
-        filtered, offset=0, viewer_user_id=user_id,
-        task_filter=task_filter, show_filter_tabs=show_filter_tabs, filter_counts=counts,
+        filtered, offset=0, viewer_user_id=user_id, task_filter=task_filter, filter_counts=counts,
     )
     await message.answer(
-        texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=task_filter if show_filter_tabs else None),
+        texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=task_filter),
         reply_markup=keyboard.as_markup(),
     )
 
@@ -469,11 +468,12 @@ async def tasks_button(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("tasks_page:"))
 async def tasks_page(callback: CallbackQuery) -> None:
-    """Листание страниц списка "📋 Мои задачи", клики по вкладкам-фильтрам
-    "Все/Мои/Общие" и кнопка "◀️ Назад к списку" в карточке задачи — все
-    используют один и тот же callback_data "tasks_page:{offset}:{filter}"
-    (filter опущен → "all", для совместимости со старыми сообщениями,
-    отправленными до появления фильтров)."""
+    """Листание страниц списка "📋 Мои задачи", клики по вкладкам-категориям
+    "Все/Покупки/Оплата/Визиты/Дела" и кнопка "◀️ Назад к списку" в карточке
+    задачи — все используют один и тот же callback_data
+    "tasks_page:{offset}:{filter}" (filter опущен → "all", для
+    совместимости со старыми сообщениями, отправленными до появления
+    фильтров)."""
     parts = callback.data.split(":")
     offset = int(parts[1])
     task_filter = parts[2] if len(parts) > 2 else TASKS_FILTER_ALL
@@ -485,7 +485,7 @@ async def tasks_page(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
-    filtered, show_filter_tabs, counts = payload
+    filtered, counts = payload
     if not filtered:
         await callback.message.edit_text(texts.no_tasks_in_filter_text(task_filter))
         await callback.answer()
@@ -494,14 +494,12 @@ async def tasks_page(callback: CallbackQuery) -> None:
     timeutils.localize_tasks(filtered, await _user_offset(user_id))
 
     keyboard, offset = tasks_page_keyboard(
-        filtered, offset, viewer_user_id=user_id,
-        task_filter=task_filter, show_filter_tabs=show_filter_tabs, filter_counts=counts,
+        filtered, offset, viewer_user_id=user_id, task_filter=task_filter, filter_counts=counts,
     )
     await callback.message.edit_text(
-        texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=task_filter if show_filter_tabs else None),
+        texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=task_filter),
         reply_markup=keyboard.as_markup(),
     )
-    await callback.answer()
     await callback.answer()
 
 
@@ -623,6 +621,14 @@ async def complete_task(
             )
         except TelegramBadRequest:
             pass
+
+    if result.recurring_next_deadline is not None:
+        # Регулярный платёж (категория "💳 Оплата" с автоповтором) — новая
+        # задача-повтор уже создана (см. services.task_actions.complete_task_core),
+        # короткая приписка вместо молчания о том, что "следующий раз"
+        # никуда не делся.
+        local_next = timeutils.to_user(result.recurring_next_deadline, await _user_offset(user_id))
+        await callback.message.answer(texts.recurring_task_created_text(result.task_title, local_next))
 
     return result.task_title, result.xp_amount
 
@@ -747,6 +753,7 @@ async def add_task_from_text(message: Message) -> None:
             reply_markup=task_card_keyboard(
                 pending_task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
                 is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
             ).as_markup(),
         )
         return
@@ -895,6 +902,11 @@ async def _create_task_with_ai(
 
     if parsed.title and parsed.title != task.title:
         await update_task_title(task_id=task.task_id, user_id=user_id, title=parsed.title)
+
+    # Категория — уже всегда какое-то значение (по умолчанию "Дела", см.
+    # services.ai_parser.ParsedTask.category), применяем её тем же
+    # способом, что и остальные распознанные поля выше.
+    await set_task_category(task_id=task.task_id, user_id=user_id, category=parsed.category)
 
     if parsed.priority is not None:
         await set_task_priority(task_id=task.task_id, user_id=user_id, priority=parsed.priority)
@@ -1083,6 +1095,7 @@ async def wiz_cancel(callback: CallbackQuery) -> None:
         task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -1242,6 +1255,7 @@ async def cal_none(callback: CallbackQuery) -> None:
             task_card_keyboard(
                 task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
                 is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
             ).as_markup(),
         )
 
@@ -1308,6 +1322,7 @@ async def _save_all_day_deadline(
         task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -1438,6 +1453,7 @@ async def td_confirm(callback: CallbackQuery) -> None:
         task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -1549,6 +1565,7 @@ async def rmd_done(callback: CallbackQuery) -> None:
         task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -1744,6 +1761,7 @@ async def card_open(callback: CallbackQuery) -> None:
         reply_markup=task_card_keyboard(
             task_id, offset, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -1843,6 +1861,7 @@ async def card_chk_in(callback: CallbackQuery) -> None:
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
         reply_markup=task_card_keyboard(
             task_id, offset=0, in_checklist_today=True, is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -1875,8 +1894,142 @@ async def card_chk_out(callback: CallbackQuery) -> None:
         texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
         reply_markup=task_card_keyboard(
             task_id, offset=0, in_checklist_today=False, is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
+
+
+@router.callback_query(F.data.startswith("card_category:"))
+async def card_category(callback: CallbackQuery) -> None:
+    """Кнопка "🗂 Категория: …" в карточке задачи — открывает экран выбора
+    категории (см. keyboards.category_picker_keyboard). Категория — не
+    вопрос владения (см. database.requests.set_task_category), поэтому
+    доступна и владельцу, и партнёру по общей задаче, как и остальные
+    кнопки редактирования карточки."""
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.category_picker_prompt_text(task.title),
+        reply_markup=category_picker_keyboard(task_id, task.category).as_markup(),
+    )
+
+
+async def _render_task_card_after_edit(callback: CallbackQuery, task_id: int, toast: str) -> None:
+    """Общий "хвост" для экранов выбора категории/повтора — сохраняет ничего
+    сам не делает, просто перерисовывает карточку задачи после того, как
+    вызывающий код уже применил изменение (или отменил его)."""
+    user_id = callback.from_user.id
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await callback.answer(toast)
+    reminders = await get_task_reminders(task_id)
+    shared_by_partner, can_toggle_shared = await _task_card_extras(task, user_id)
+    timeutils.localize_task(task, await _user_offset(user_id))
+    await callback.message.edit_text(
+        texts.task_card_text(task, reminders, shared_by_partner=shared_by_partner),
+        reply_markup=task_card_keyboard(
+            task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
+            is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
+        ).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("cat_set:"))
+async def cat_set(callback: CallbackQuery) -> None:
+    """Выбор новой категории на экране "🗂 Категория" — сохраняет и сразу
+    возвращает на карточку задачи. Если новая категория — не "💳 Оплата", а
+    у задачи был включён автоповтор — сам автоповтор НЕ сбрасываем (он
+    просто снова станет доступен, если категорию вернуть обратно), кнопка
+    "🔁 Повтор" в карточке при этом временно скрывается — ей это
+    RecurrenceRule.none тоже не мешает, ничего срабатывать не будет только
+    для категорий, для которых сама кнопка не показана."""
+    _, task_id_str, category_value = callback.data.split(":", maxsplit=2)
+    task_id, user_id = int(task_id_str), callback.from_user.id
+
+    try:
+        category = TaskCategory(category_value)
+    except ValueError:
+        await callback.answer("Не удалось разобрать категорию 🤔", show_alert=True)
+        return
+
+    success = await set_task_category(task_id=task_id, user_id=user_id, category=category)
+    if not success:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await _render_task_card_after_edit(callback, task_id, "Категория сохранена ✅")
+
+
+@router.callback_query(F.data.startswith("cat_cancel:"))
+async def cat_cancel(callback: CallbackQuery) -> None:
+    """"◀️ Отмена" на экране выбора категории — просто возвращает карточку
+    задачи без изменений."""
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    await _render_task_card_after_edit(callback, task_id, "Отменено")
+
+
+@router.callback_query(F.data.startswith("card_recur:"))
+async def card_recur(callback: CallbackQuery) -> None:
+    """
+    Кнопка "🔁 Повтор: …" в карточке задачи — открывает экран выбора
+    автоповтора (см. keyboards.recurrence_picker_keyboard). Показывается
+    только для категории "💳 Оплата" (см. keyboards.task_card_keyboard), но
+    на всякий случай (например, категория поменялась в другой вкладке,
+    пока это сообщение было открыто) перепроверяем здесь же, а не
+    полагаемся только на то, что кнопки не было видно.
+    """
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    task = await get_task(task_id=task_id, user_id=callback.from_user.id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+    if task.category != TaskCategory.payments:
+        await callback.answer("Автоповтор пока доступен только категории «💳 Оплата» 🤔", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_text(
+        texts.recurrence_picker_prompt_text(task.title),
+        reply_markup=recurrence_picker_keyboard(task_id, task.recurrence_rule).as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("recur_set:"))
+async def recur_set(callback: CallbackQuery) -> None:
+    """Выбор автоповтора на экране "🔁 Повтор" — сохраняет и сразу
+    возвращает на карточку задачи."""
+    _, task_id_str, rule_value = callback.data.split(":", maxsplit=2)
+    task_id, user_id = int(task_id_str), callback.from_user.id
+
+    try:
+        rule = RecurrenceRule(rule_value)
+    except ValueError:
+        await callback.answer("Не удалось разобрать вариант повтора 🤔", show_alert=True)
+        return
+
+    success = await set_task_recurrence(task_id=task_id, user_id=user_id, rule=rule)
+    if not success:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    await _render_task_card_after_edit(callback, task_id, "Повтор сохранён ✅")
+
+
+@router.callback_query(F.data.startswith("recur_cancel:"))
+async def recur_cancel(callback: CallbackQuery) -> None:
+    """"◀️ Отмена" на экране выбора автоповтора — просто возвращает
+    карточку задачи без изменений."""
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    await _render_task_card_after_edit(callback, task_id, "Отменено")
 
 
 @router.callback_query(F.data.startswith("card_delete:"))
@@ -1927,6 +2080,7 @@ async def card_delno(callback: CallbackQuery) -> None:
         reply_markup=task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -1958,6 +2112,7 @@ async def card_toggle_shared(callback: CallbackQuery) -> None:
         reply_markup=task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
 
@@ -2096,5 +2251,6 @@ async def remind_open_card(callback: CallbackQuery) -> None:
         reply_markup=task_card_keyboard(
             task_id, offset=0, in_checklist_today=texts.task_in_checklist_today(task),
             is_shared=task.shared, can_toggle_shared=can_toggle_shared,
+            category=task.category, recurrence_rule=task.recurrence_rule,
         ).as_markup(),
     )
