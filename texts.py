@@ -1433,6 +1433,31 @@ def purchase_added_text(title: str) -> str:
     return f"🛒 Добавлено в покупки: «{escape(title)}»"
 
 
+def purchases_added_text(titles: list[str]) -> str:
+    """
+    Как purchase_added_text, но когда одно сообщение (обычно голосовое)
+    содержало сразу НЕСКОЛЬКО товаров списком — см.
+    services.ai_parser.ParsedTask.extra_titles/split_purchase_items и
+    handlers/tasks.py::_create_task_with_ai/_handle_purchase_add. Каждый
+    товар стал отдельной чекбоксной записью в "🛒 Покупки" — показываем их
+    все, чтобы было видно, что список разобрался правильно, а не слился в
+    одну строку.
+    """
+    bullets = "\n".join(f"• {escape(title)}" for title in titles)
+    return f"🛒 Добавлено в покупки ({len(titles)}):\n{bullets}"
+
+
+def purchases_split_text(titles: list[str]) -> str:
+    """
+    Результат кнопки "✂️ Разделить на отдельные покупки" (см.
+    handlers/tasks.py::card_split) — старая запись со слипшимся списком
+    товаров в заголовке удалена, вместо неё созданы отдельные чекбоксные
+    покупки, перечисленные здесь.
+    """
+    bullets = "\n".join(f"• {escape(title)}" for title in titles)
+    return f"✂️ Разделено на {len(titles)} отдельных покупок:\n{bullets}\n\nСписок обновлён — загляни в «🛒 Покупки»."
+
+
 def purchase_add_prompt_text() -> str:
     """Приглашение написать (или наговорить) название товара следующим
     сообщением — кнопка "➕ Добавить покупку" во вкладке "🛒 Покупки" (см.

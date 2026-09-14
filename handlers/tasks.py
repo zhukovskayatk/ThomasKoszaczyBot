@@ -729,12 +729,34 @@ async def _handle_purchase_add(message: Message, user_id: int, title: str) -> No
     попросила именно "сразу в список, без вопросов о приоритете/сроке".
     Приоритет остаётся по умолчанию (Medium) — за отметку купленной такая
     задача даёт ровно ту же награду (XP), что и любая обычная.
+
+    Этот путь не проходит через ИИ-разбор (быстрое добавление специально
+    без него) — поэтому список из нескольких товаров через запятую/"и"
+    ("шампунь, йод и соду") разбиваем сами, см.
+    ai_parser.split_purchase_items — иначе весь текст ушёл бы в заголовок
+    одной задачи, как это уже случалось при надиктовывании списка целиком
+    (см. _create_task_with_ai про тот же сценарий через ИИ).
     """
     if not await can_create_task(user_id):
         await message.answer(texts.free_task_limit_reached_text(), reply_markup=main_menu_keyboard)
         return
-    task = await add_task(user_id=user_id, title=title, category=TaskCategory.purchases)
-    await message.answer(texts.purchase_added_text(task.title))
+
+    item_titles = ai_parser.split_purchase_items(title)
+    created_titles: list[str] = []
+    for item_title in item_titles:
+        if not await can_create_task(user_id):
+            break
+        task = await add_task(user_id=user_id, title=item_title, category=TaskCategory.purchases)
+        created_titles.append(task.title)
+
+    if not created_titles:
+        await message.answer(texts.free_task_limit_reached_text(), reply_markup=main_menu_keyboard)
+        return
+
+    if len(created_titles) == 1:
+        await message.answer(texts.purchase_added_text(created_titles[0]))
+    else:
+        await message.answer(texts.purchases_added_text(created_titles))
 
 
 @router.callback_query(F.data == "buy_add")
@@ -1030,7 +1052,25 @@ async def _create_task_with_ai(
         # приоритета/срока: любой AI-детект приоритета/дедлайна выше уже
         # тихо сохранён в БД (на случай, если он и правда там был), но
         # интерактивно ничего больше не спрашиваем — товару это не нужно.
-        await message.answer(texts.purchase_added_text(task.title))
+        #
+        # Если ИИ распознал в ОДНОМ сообщении сразу НЕСКОЛЬКО товаров (см.
+        # ParsedTask.extra_titles) — заголовок уже созданной задачи выше
+        # переписан на ПЕРВЫЙ товар (parsed.title), а на каждый оставшийся
+        # заводим отдельную покупку здесь же, чтобы список пополнялся
+        # отдельными чекбоксами, а не одной строкой со всем перечислением
+        # сразу (именно так раньше "шампунь, йод и сода" превращались в
+        # одну задачу с этим текстом целиком в заголовке).
+        created_titles = [task.title]
+        for extra_title in parsed.extra_titles:
+            if not await can_create_task(user_id):
+                break
+            extra_task = await add_task(user_id=user_id, title=extra_title, category=TaskCategory.purchases)
+            created_titles.append(extra_task.title)
+
+        if len(created_titles) == 1:
+            await message.answer(texts.purchase_added_text(task.title))
+        else:
+            await message.answer(texts.purchases_added_text(created_titles))
         return
 
     if parsed.priority is None:
@@ -2137,6 +2177,51 @@ async def recur_cancel(callback: CallbackQuery) -> None:
     карточку задачи без изменений."""
     task_id = int(callback.data.split(":", maxsplit=1)[1])
     await _render_task_card_after_edit(callback, task_id, "Отменено")
+
+
+@router.callback_query(F.data.startswith("card_split:"))
+async def card_split(callback: CallbackQuery) -> None:
+    """
+    "✂️ Разделить на отдельные покупки" в карточке товара (только категория
+    "🛒 Покупки", см. keyboards.task_card_keyboard) — берёт текущий
+    заголовок (например, "Купить шампунь, йод и соду" — так раньше
+    получалось, когда список товаров надиктовывали одним сообщением, см.
+    ai_parser.ParsedTask.extra_titles про то, что для НОВЫХ сообщений это
+    уже не повторится) и режет его на отдельные товары (см.
+    ai_parser.split_purchase_items), заводя под каждый свою чекбоксную
+    запись, а исходную — удаляя.
+
+    Если делить нечего (в заголовке и так только один товар) — просто
+    сообщаем об этом всплывающим тостом, ничего не меняя.
+    """
+    task_id = int(callback.data.split(":", maxsplit=1)[1])
+    user_id = callback.from_user.id
+    task = await get_task(task_id=task_id, user_id=user_id)
+    if task is None:
+        await callback.answer("Не удалось найти эту задачу 🤔", show_alert=True)
+        return
+
+    items = ai_parser.split_purchase_items(task.title)
+    if len(items) < 2:
+        await callback.answer("Тут и так один товар — делить нечего 🤔", show_alert=True)
+        return
+
+    created_titles: list[str] = []
+    for item_title in items:
+        if not await can_create_task(user_id):
+            break
+        new_task = await add_task(user_id=user_id, title=item_title, category=TaskCategory.purchases)
+        created_titles.append(new_task.title)
+
+    if not created_titles:
+        await callback.answer("Не получилось создать новые покупки — лимит бесплатных задач исчерпан 🤔", show_alert=True)
+        return
+
+    scheduler_service.unschedule_all_for_task(task_id)
+    await delete_task(task_id=task_id, user_id=user_id)
+
+    await callback.answer(f"Разделено на {len(created_titles)} 🛒")
+    await callback.message.edit_text(texts.purchases_split_text(created_titles))
 
 
 @router.callback_query(F.data.startswith("card_delete:"))

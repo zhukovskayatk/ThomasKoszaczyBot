@@ -794,7 +794,10 @@ def task_card_keyboard(
     показывается ТОЛЬКО для категории "💳 Оплата" (см.
     category_picker_keyboard/recurrence_picker_keyboard) — остальным
     категориям автоповтор пока недоступен, см. решение "Сразу с
-    автоповтором" по итогам обсуждения категорий задач.
+    автоповтором" по итогам обсуждения категорий задач. Для категории
+    "🛒 Покупки" дополнительно показывается кнопка "✂️ Разделить на
+    отдельные покупки" (см. handlers/tasks.py::card_split) — на случай,
+    если в заголовке одной записи оказалось сразу несколько товаров.
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить текст", callback_data=f"card_edittext:{task_id}")
@@ -805,6 +808,14 @@ def task_card_keyboard(
 
     if category == TaskCategory.payments:
         builder.button(text=f"🔁 Повтор: {RECURRENCE_LABELS[recurrence_rule]}", callback_data=f"card_recur:{task_id}")
+        row_sizes.append(1)
+
+    if category == TaskCategory.purchases:
+        # Разбить уже созданную запись вида "Купить шампунь, йод и соду" на
+        # отдельные чекбоксные покупки (см. handlers/tasks.py::card_split) —
+        # нужна и для старых "слипшихся" записей, и как страховка на
+        # случай, когда авто-разбивка при создании не сработала.
+        builder.button(text="✂️ Разделить на отдельные покупки", callback_data=f"card_split:{task_id}")
         row_sizes.append(1)
 
     if in_checklist_today:
