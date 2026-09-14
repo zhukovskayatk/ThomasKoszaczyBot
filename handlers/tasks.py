@@ -89,6 +89,7 @@ from keyboards import (
     QUICK_CLOSE_BUTTON_TEXT,
     TASKS_BUTTON_TEXT,
     TASKS_FILTER_ALL,
+    TASKS_FILTER_PURCHASES,
     calendar_keyboard,
     category_picker_keyboard,
     deadline_presets_keyboard,
@@ -124,6 +125,13 @@ _pending_rename: dict[int, int] = {}
 # простой словарь в памяти процесса, что и _pending_rename выше — без
 # полноценного FSM.
 _pending_custom_reminder: dict[int, tuple[str, int]] = {}
+
+# user_id'ы, ждущие текстом/голосом название товара для "🛒 Покупки" (кнопка
+# "➕ Добавить покупку" на вкладке, см. buy_add/_handle_purchase_add). Просто
+# множество, а не словарь — здесь не нужно везти с собой никакой
+# дополнительный контекст, в отличие от _pending_rename/_pending_custom_reminder
+# выше.
+_pending_purchase_add: set[int] = set()
 
 
 @dataclass
@@ -713,6 +721,71 @@ async def _qc_finalize(callback: CallbackQuery, session: "_QuickCloseSession", k
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
+async def _handle_purchase_add(message: Message, user_id: int, title: str) -> None:
+    """
+    Общая логика для кнопки "➕ Добавить покупку" (текстом и голосом, см.
+    buy_add/_pending_purchase_add) — создаёт задачу сразу в категории
+    "🛒 Покупки", БЕЗ обычного мастера приоритета/срока: пользователь
+    попросила именно "сразу в список, без вопросов о приоритете/сроке".
+    Приоритет остаётся по умолчанию (Medium) — за отметку купленной такая
+    задача даёт ровно ту же награду (XP), что и любая обычная.
+    """
+    if not await can_create_task(user_id):
+        await message.answer(texts.free_task_limit_reached_text(), reply_markup=main_menu_keyboard)
+        return
+    task = await add_task(user_id=user_id, title=title, category=TaskCategory.purchases)
+    await message.answer(texts.purchase_added_text(task.title))
+
+
+@router.callback_query(F.data == "buy_add")
+async def buy_add(callback: CallbackQuery) -> None:
+    """"➕ Добавить покупку" во вкладке "🛒 Покупки" — ждём текстом/голосом
+    название товара следующим сообщением (см. _pending_purchase_add,
+    add_task_from_text/add_task_from_voice)."""
+    _pending_purchase_add.add(callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer(texts.purchase_add_prompt_text())
+
+
+@router.callback_query(F.data.startswith("buy_toggle:"))
+async def buy_toggle(callback: CallbackQuery) -> None:
+    """
+    Тап по строке прямо во вкладке "🛒 Покупки" — сразу отмечает покупку
+    купленной (та же полная награда, что и за обычную задачу, см.
+    complete_task/_send_reward), без захода в карточку задачи: список
+    покупок должен вестись одним тапом, как в любом обычном списке
+    покупок. После отметки список во вкладке "Покупки" перерисовывается на
+    месте — купленный товар просто исчезает из него (get_active_tasks
+    возвращает только ещё НЕ выполненные задачи).
+    """
+    _, task_id_str, offset_str = callback.data.split(":", maxsplit=2)
+    task_id, offset = int(task_id_str), int(offset_str)
+    user_id = callback.from_user.id
+
+    result = await complete_task(callback, task_id, send_reward=True)
+    if result is None:
+        return
+
+    payload = await _tasks_view_payload(user_id, TASKS_FILTER_PURCHASES)
+    if payload is None:
+        await callback.message.edit_text(texts.no_active_tasks_text())
+        return
+
+    filtered, counts = payload
+    if not filtered:
+        await callback.message.edit_text(texts.no_tasks_in_filter_text(TASKS_FILTER_PURCHASES))
+        return
+
+    timeutils.localize_tasks(filtered, await _user_offset(user_id))
+    keyboard, offset = tasks_page_keyboard(
+        filtered, offset, viewer_user_id=user_id, task_filter=TASKS_FILTER_PURCHASES, filter_counts=counts,
+    )
+    await callback.message.edit_text(
+        texts.tasks_list_text(filtered, viewer_user_id=user_id, task_filter=TASKS_FILTER_PURCHASES),
+        reply_markup=keyboard.as_markup(),
+    )
+
+
 # --- Создание задачи (или переименование) из обычного текстового сообщения ----
 
 # Важно: этот хендлер регистрируется последним и ловит любой текст,
@@ -720,6 +793,14 @@ async def _qc_finalize(callback: CallbackQuery, session: "_QuickCloseSession", k
 @router.message(F.text, ~F.text.startswith("/"))
 async def add_task_from_text(message: Message) -> None:
     user_id = message.from_user.id
+
+    if user_id in _pending_purchase_add:
+        # Ждали текст названия товара (кнопка "➕ Добавить покупку" во
+        # вкладке "🛒 Покупки", см. buy_add) — это не обычная задача через
+        # мастер, а прямое добавление в список покупок.
+        _pending_purchase_add.discard(user_id)
+        await _handle_purchase_add(message, user_id, message.text)
+        return
 
     pending_custom_reminder = _pending_custom_reminder.pop(user_id, None)
     if pending_custom_reminder is not None:
@@ -783,6 +864,24 @@ async def add_task_from_voice(message: Message) -> None:
     того, кому всё равно откажем.
     """
     user_id = message.from_user.id
+
+    if user_id in _pending_purchase_add:
+        # Ждали голос с названием товара (см. add_task_from_text про тот же
+        # случай текстом) — распознаём и сразу добавляем в список покупок,
+        # без обычного мастера приоритета/срока.
+        _pending_purchase_add.discard(user_id)
+        if not await can_use_ai_parse(user_id):
+            await message.answer(texts.free_voice_limit_reached_text())
+            return
+        file_info = await message.bot.get_file(message.voice.file_id)
+        audio_file = await message.bot.download_file(file_info.file_path)
+        transcribed = await voice_service.transcribe_voice(audio_file.read())
+        await register_ai_parse_usage(user_id)
+        if not transcribed:
+            await message.answer(texts.voice_transcription_unavailable_text())
+            return
+        await _handle_purchase_add(message, user_id, transcribed)
+        return
 
     pending_custom_reminder = _pending_custom_reminder.pop(user_id, None)
     if pending_custom_reminder is not None:
@@ -924,6 +1023,14 @@ async def _create_task_with_ai(
 
     task = await get_task(task_id=task.task_id, user_id=user_id)
     if task is None:
+        return
+
+    if parsed.category == TaskCategory.purchases:
+        # "🛒 Покупки" — по просьбе пользователя сразу в список, без мастера
+        # приоритета/срока: любой AI-детект приоритета/дедлайна выше уже
+        # тихо сохранён в БД (на случай, если он и правда там был), но
+        # интерактивно ничего больше не спрашиваем — товару это не нужно.
+        await message.answer(texts.purchase_added_text(task.title))
         return
 
     if parsed.priority is None:

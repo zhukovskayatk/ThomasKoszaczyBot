@@ -267,6 +267,22 @@ def _task_button_label(task, viewer_user_id: int | None = None) -> str:
     return f"{marker} {partner_marker}{short_title}"
 
 
+def _purchase_button_label(task, viewer_user_id: int | None = None) -> str:
+    """
+    Текст кнопки одной покупки во вкладке "🛒 Покупки" — простой чекбокс
+    ▫️ вместо иконки срочности (см. _task_button_label): дедлайн/приоритет
+    для товара обычно не имеют значения, а тап по строке сразу отмечает
+    покупку купленной (см. handlers/tasks.py::buy_toggle), а не открывает
+    карточку задачи.
+    """
+    partner_marker = "👥 " if (viewer_user_id is not None and task.user_id != viewer_user_id) else ""
+    short_title = (
+        task.title if len(task.title) <= _TASK_BUTTON_TITLE_LIMIT
+        else task.title[:_TASK_BUTTON_TITLE_LIMIT - 1] + "…"
+    )
+    return f"▫️ {partner_marker}{short_title}"
+
+
 # Вкладки-фильтры над списком "📋 Мои задачи" (см. tasks_page_keyboard) —
 # ВСЕГДА показываются всем, независимо от партнёрского статуса: категории
 # ("Категории задач") не про то, чьё это дело, а про ЧТО за дело — в
@@ -317,6 +333,14 @@ def tasks_page_keyboard(
     "◀️ Назад к списку" из карточки всегда возвращает на "Все" (см.
     task_card_keyboard) — сознательное упрощение, чтобы не тащить фильтр
     ещё и через карточку с её десятком точек входа.
+
+    Вкладка "🛒 Покупки" — единственное исключение из "тап открывает
+    карточку": там тап по строке сразу отмечает покупку купленной (см.
+    _purchase_button_label/buy_toggle в handlers/tasks.py) — список покупок
+    должен вестись одним тапом, как в любом обычном списке покупок, без
+    захода в карточку задачи с её приоритетом/сроком/напоминаниями, которые
+    для товара обычно не нужны. Там же — кнопка "➕ Добавить покупку" (см.
+    buy_add) для быстрого добавления без мастера приоритета/срока.
     """
     offset = max(0, offset)
     if tasks_sorted and offset >= len(tasks_sorted):
@@ -324,6 +348,7 @@ def tasks_page_keyboard(
         offset = last_page_start
 
     page = tasks_sorted[offset:offset + TASKS_PAGE_SIZE]
+    is_purchases_tab = task_filter == TASKS_FILTER_PURCHASES
 
     builder = InlineKeyboardBuilder()
     row_sizes = []
@@ -333,14 +358,26 @@ def tasks_page_keyboard(
         n = counts.get(key, 0)
         text = f"• {label} ({n})" if key == task_filter else f"{label} ({n})"
         builder.button(text=text, callback_data=f"tasks_page:0:{key}")
-    # 5 вкладок в один ряд были бы слишком узкими на телефоне — переносим
-    # "Все" отдельной строкой сверху, остальные четыре — в один ряд ниже.
-    row_sizes.extend([1, 4])
+    # 5 вкладок в один ряд (или даже 4 в один) слишком узкие на телефоне —
+    # подписи обрезаются и вкладки становится не разобрать (см. жалобу
+    # пользователя на скриншоте). "Все" — отдельной строкой сверху, дальше
+    # по 2 вкладки в ряд: Покупки+Оплата, затем Визиты+Дела.
+    row_sizes.extend([1, 2, 2])
+
+    if is_purchases_tab:
+        builder.button(text="➕ Добавить покупку", callback_data="buy_add")
+        row_sizes.append(1)
 
     for task in page:
-        builder.button(
-            text=_task_button_label(task, viewer_user_id), callback_data=f"card_open:{task.task_id}:{offset}"
-        )
+        if is_purchases_tab:
+            builder.button(
+                text=_purchase_button_label(task, viewer_user_id),
+                callback_data=f"buy_toggle:{task.task_id}:{offset}",
+            )
+        else:
+            builder.button(
+                text=_task_button_label(task, viewer_user_id), callback_data=f"card_open:{task.task_id}:{offset}"
+            )
     row_sizes.extend([1] * len(page))
 
     has_prev = offset > 0

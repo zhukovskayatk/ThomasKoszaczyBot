@@ -1422,6 +1422,24 @@ def recurrence_picker_prompt_text(task_title: str) -> str:
     return f"🔁 Как часто повторять «{escape(task_title)}»?"
 
 
+def purchase_added_text(title: str) -> str:
+    """
+    Подтверждение после добавления товара в "🛒 Покупки" — БЕЗ мастера
+    приоритета/срока (см. handlers/tasks.py::_create_task_with_ai/
+    _handle_purchase_add): по просьбе пользователя список покупок
+    пополняется сразу, без лишних вопросов — купить хлеб не требует
+    выбирать ему приоритет.
+    """
+    return f"🛒 Добавлено в покупки: «{escape(title)}»"
+
+
+def purchase_add_prompt_text() -> str:
+    """Приглашение написать (или наговорить) название товара следующим
+    сообщением — кнопка "➕ Добавить покупку" во вкладке "🛒 Покупки" (см.
+    handlers/tasks.py::buy_add)."""
+    return "🛒 Что купить? Напиши названием или голосом 👇"
+
+
 def recurring_task_created_text(task_title: str, next_deadline: datetime) -> str:
     """
     Короткая приписка после закрытия регулярного платежа (категория
