@@ -983,6 +983,35 @@ def notification_settings_keyboard(user) -> InlineKeyboardBuilder:
     return builder
 
 
+# Чисто декоративная строка-разделитель (NOOP-кнопка) — тот же визуальный
+# приём, что просила пользователь в своём макете экрана: тонкая линия
+# перед "◀️ Назад", отделяющая стрелки-степперы от навигации.
+_SEPARATOR_LABEL = "──────────────────"
+
+
+def _time_stepper_rows(builder: InlineKeyboardBuilder, minutes: int, adjust_prefix: str) -> None:
+    """
+    Добавляет в builder два ряда независимых степперов — "Час" (шаг ±60
+    минут) и "Мин" (шаг ±15 минут), каждый со своей явной подписью вместо
+    одного одинакового "HH:MM", продублированного на обоих рядах, как
+    было раньше (по итогам разбора макета пользователя — тот дублирующийся
+    лейбл на двух рядах и ощущался как лишний). Стрелки 🔼/🔽 (а не
+    текстовые ➖/➕, как в остальном боте) — тоже по её макету; порядок
+    "🔼 (увеличить) слева, значение по центру, 🔽 (уменьшить) справа"
+    сохранён ровно как в присланном примере. adjust_prefix — тот же
+    callback-префикс, что и раньше (см. database.requests.adjust_*_time),
+    просто теперь применяется раздельно к рядам "час"/"мин" вместо
+    одного ряда с двумя подписями.
+    """
+    hours, mins = divmod(minutes % (24 * 60), 60)
+    builder.button(text="🔼", callback_data=f"{adjust_prefix}:60")
+    builder.button(text=f"Час: {hours:02d}", callback_data=NOOP_CALLBACK)
+    builder.button(text="🔽", callback_data=f"{adjust_prefix}:-60")
+    builder.button(text="🔼", callback_data=f"{adjust_prefix}:15")
+    builder.button(text=f"Мин: {mins:02d}", callback_data=NOOP_CALLBACK)
+    builder.button(text="🔽", callback_data=f"{adjust_prefix}:-15")
+
+
 def notif_time_screen_keyboard(
     enabled: bool, time_minutes: int, toggle_callback: str, adjust_prefix: str
 ) -> InlineKeyboardBuilder:
@@ -991,94 +1020,98 @@ def notif_time_screen_keyboard(
     настройками (утренний чек-лист, приглашение и вечерняя сводка
     интерактивного чек-листа дня, см. handlers/profile.py::
     mctime_open/cmtime_open/cetime_open), у которых одинаковая форма:
-    один тумблер и один степпер времени. toggle_callback — ПОЛНЫЙ
-    callback_data тумблера (у каждого экрана свой собственный — "mctime_toggle"/
-    "cmtime_toggle"/"cetime_toggle", а НЕ общий "notif_toggle:...", как
-    раньше на главном экране уведомлений — иначе после тумблера человека
-    выкидывало бы обратно на главный экран уведомлений, а не оставляло на
-    текущем). adjust_prefix — префикс callback_data степпера (см.
-    handlers/profile.py::mctime_adjust/cmtime_adjust/cetime_adjust и
-    соответствующие database.requests.adjust_*_time). Степпер — тот же
-    приём ➖1ч/➕15м, что и в time_drum_keyboard/timezone_settings_keyboard,
-    значение меняется сразу, без отдельной кнопки "Сохранить".
+    один тумблер и один степпер времени (см. _time_stepper_rows выше).
+    toggle_callback — ПОЛНЫЙ callback_data тумблера (у каждого экрана
+    свой собственный — "mctime_toggle"/"cmtime_toggle"/"cetime_toggle", а
+    НЕ общий "notif_toggle:...", как раньше на главном экране
+    уведомлений — иначе после тумблера человека выкидывало бы обратно на
+    главный экран уведомлений, а не оставляло на текущем). Значение
+    меняется сразу же по тапу, без отдельной кнопки "Сохранить" — как и
+    везде в боте.
     """
     builder = InlineKeyboardBuilder()
     mark = "☑️" if enabled else "◻️"
     builder.button(text=f"{mark} Включено", callback_data=toggle_callback)
 
-    label = format_time_of_day(time_minutes)
-    builder.button(text="➖ 1 ч", callback_data=f"{adjust_prefix}:-60")
-    builder.button(text=label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 1 ч", callback_data=f"{adjust_prefix}:60")
-    builder.button(text="➖ 15 м", callback_data=f"{adjust_prefix}:-15")
-    builder.button(text=label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 15 м", callback_data=f"{adjust_prefix}:15")
+    _time_stepper_rows(builder, time_minutes, adjust_prefix)
 
+    builder.button(text=_SEPARATOR_LABEL, callback_data=NOOP_CALLBACK)
     builder.button(text="◀️ Назад к уведомлениям", callback_data="notif_open")
-    builder.adjust(1, 3, 3, 1)
+    builder.adjust(1, 3, 3, 1, 1)
     return builder
 
 
 def quiet_hours_screen_keyboard(enabled: bool, start_minutes: int, end_minutes: int) -> InlineKeyboardBuilder:
     """
     Экран "🌙 Тихие часы" (см. handlers/profile.py::qh_open/qh_adjust) —
-    как notif_time_screen_keyboard выше, но с ДВУМЯ независимыми
-    степперами (начало/конец окна) вместо одного — раньше окно было
-    жёстко зашито 22:00–08:00 на всех, см. User.quiet_hours_start_minutes/
+    как notif_time_screen_keyboard выше, но с ДВУМЯ независимыми парами
+    степперов (начало/конец окна) вместо одной — раньше окно было жёстко
+    зашито 22:00–08:00 на всех, см. User.quiet_hours_start_minutes/
     quiet_hours_end_minutes.
     """
     builder = InlineKeyboardBuilder()
     mark = "☑️" if enabled else "◻️"
     builder.button(text=f"{mark} Включено", callback_data="qh_toggle")
 
-    start_label = f"🌙 Начало {format_time_of_day(start_minutes)}"
-    builder.button(text="➖ 1 ч", callback_data="qhs_adj:-60")
-    builder.button(text=start_label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 1 ч", callback_data="qhs_adj:60")
-    builder.button(text="➖ 15 м", callback_data="qhs_adj:-15")
-    builder.button(text=start_label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 15 м", callback_data="qhs_adj:15")
+    builder.button(text="🌙 Начало", callback_data=NOOP_CALLBACK)
+    _time_stepper_rows(builder, start_minutes, "qhs_adj")
 
-    end_label = f"☀️ Конец {format_time_of_day(end_minutes)}"
-    builder.button(text="➖ 1 ч", callback_data="qhe_adj:-60")
-    builder.button(text=end_label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 1 ч", callback_data="qhe_adj:60")
-    builder.button(text="➖ 15 м", callback_data="qhe_adj:-15")
-    builder.button(text=end_label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 15 м", callback_data="qhe_adj:15")
+    builder.button(text="☀️ Конец", callback_data=NOOP_CALLBACK)
+    _time_stepper_rows(builder, end_minutes, "qhe_adj")
 
+    builder.button(text=_SEPARATOR_LABEL, callback_data=NOOP_CALLBACK)
     builder.button(text="◀️ Назад к уведомлениям", callback_data="notif_open")
-    builder.adjust(1, 3, 3, 3, 3, 1)
+    builder.adjust(1, 1, 3, 3, 1, 3, 3, 1, 1)
     return builder
+
+
+# Карусель "Выкл · Пн · Вт · Ср · Чт · Пт · Сб · Вс" для "🛒 Напоминание о
+# покупках" (см. shopping_reminder_screen_keyboard ниже) — индекс 0 значит
+# "выключено", 1..7 — понедельник..воскресенье (индекс-1 = datetime.weekday()).
+# "Выкл" — такое же полноправное значение карусели, как и любой день,
+# поэтому отдельного тумблера ☑️/◻️ на этом экране больше нет: один тап по
+# ◀️/▶️ сразу меняет и включённость, и (если это день) день недели —
+# см. handlers/profile.py::shprmd_cycle/database.requests.set_shopping_reminder_schedule.
+SHOPPING_CYCLE_LABELS = ["Выкл", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def shopping_cycle_state(enabled: bool, weekday: int) -> int:
+    """User.shopping_reminder_enabled/weekday -> индекс в SHOPPING_CYCLE_LABELS."""
+    return weekday % 7 + 1 if enabled else 0
+
+
+def shopping_cycle_from_state(state: int) -> tuple[bool, int]:
+    """Индекс карусели -> (enabled, weekday) для сохранения в БД."""
+    state = state % len(SHOPPING_CYCLE_LABELS)
+    if state == 0:
+        return False, 0
+    return True, state - 1
 
 
 def shopping_reminder_screen_keyboard(enabled: bool, weekday: int, time_minutes: int) -> InlineKeyboardBuilder:
     """
     Экран "🛒 Напоминание о покупках" (см. handlers/profile.py::
-    shprmd_open/shprmd_adjust/shprmd_day) — тумблер + выбор дня недели
-    (радио-кнопки, тот же приём, что и в category_picker_keyboard) +
-    степпер времени. Новая, по умолчанию выключенная фича — см.
+    shprmd_open/shprmd_cycle/shprmd_adjust) — одна строка ◀️/▶️,
+    листающая карусель "Выкл · Пн · ... · Вс" (см. SHOPPING_CYCLE_LABELS
+    выше, текущее значение — в квадратных скобках), плюс степпер времени
+    (см. _time_stepper_rows). Новая, по умолчанию выключенная фича — см.
     User.shopping_reminder_enabled/shopping_reminder_weekday/
     shopping_reminder_time_minutes.
     """
     builder = InlineKeyboardBuilder()
-    mark = "☑️" if enabled else "◻️"
-    builder.button(text=f"{mark} Включено", callback_data="shprmd_toggle")
+    state = shopping_cycle_state(enabled, weekday)
+    cycle_display = " · ".join(
+        f"[{label}]" if i == state else label for i, label in enumerate(SHOPPING_CYCLE_LABELS)
+    )
+    builder.button(text="◀️", callback_data="shcycle:-1")
+    builder.button(text=cycle_display, callback_data=NOOP_CALLBACK)
+    builder.button(text="▶️", callback_data="shcycle:1")
 
-    for i in range(7):
-        day_mark = "🔘" if i == weekday else "⚪️"
-        builder.button(text=f"{day_mark} {weekday_short_label(i)}", callback_data=f"shday_set:{i}")
+    _time_stepper_rows(builder, time_minutes, "shtime_adj")
 
-    label = format_time_of_day(time_minutes)
-    builder.button(text="➖ 1 ч", callback_data="shtime_adj:-60")
-    builder.button(text=label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 1 ч", callback_data="shtime_adj:60")
-    builder.button(text="➖ 15 м", callback_data="shtime_adj:-15")
-    builder.button(text=label, callback_data=NOOP_CALLBACK)
-    builder.button(text="➕ 15 м", callback_data="shtime_adj:15")
-
+    builder.button(text=_SEPARATOR_LABEL, callback_data=NOOP_CALLBACK)
     builder.button(text="◀️ Назад к уведомлениям", callback_data="notif_open")
-    builder.adjust(1, 4, 3, 3, 3, 1)
+    builder.adjust(3, 3, 3, 1, 1)
     return builder
 
 

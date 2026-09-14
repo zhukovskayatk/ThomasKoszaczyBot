@@ -33,6 +33,7 @@ from database.requests import (
     get_user,
     rescue_streak_with_xp,
     set_default_reminder_offsets,
+    set_shopping_reminder_schedule,
     set_shopping_reminder_weekday,
     set_user_utc_offset,
     toggle_checklist_evening_push_enabled,
@@ -51,6 +52,8 @@ from keyboards import (
     notification_settings_keyboard,
     profile_actions_keyboard,
     quiet_hours_screen_keyboard,
+    shopping_cycle_from_state,
+    shopping_cycle_state,
     shopping_reminder_screen_keyboard,
     streak_rescue_keyboard,
     timezone_settings_keyboard,
@@ -402,20 +405,41 @@ async def _render_shprmd_screen(callback: CallbackQuery, toast: str | None = Non
 @router.callback_query(F.data == "shprmd_open")
 async def shprmd_open(callback: CallbackQuery) -> None:
     """"🛒 Напоминание о покупках" в "🔔 Уведомления" — новая, по умолчанию
-    выключенная еженедельная фича: переключатель + день недели + степпер
-    времени (см. keyboards.shopping_reminder_screen_keyboard)."""
+    выключенная еженедельная фича: карусель "Выкл · Пн · ... · Вс" +
+    степпер времени (см. keyboards.shopping_reminder_screen_keyboard)."""
+    await _render_shprmd_screen(callback)
+
+
+@router.callback_query(F.data.startswith("shcycle:"))
+async def shprmd_cycle(callback: CallbackQuery) -> None:
+    """
+    ◀️/▶️ на экране "🛒 Напоминание о покупках" — листает ОБЩУЮ карусель
+    "Выкл · Пн · Вт · ... · Вс" (см. keyboards.SHOPPING_CYCLE_LABELS): один
+    тап одновременно меняет и включённость, и (если это день) день
+    недели, так что отдельного тумблера ☑️/◻️ на этом экране больше нет —
+    "Выкл" тут такое же полноправное значение карусели, как и любой день
+    (см. database.requests.set_shopping_reminder_schedule).
+    """
+    delta = int(callback.data.split(":", maxsplit=1)[1])
+    user = await get_or_create_user(user_id=callback.from_user.id, username=callback.from_user.username)
+    state = shopping_cycle_state(user.shopping_reminder_enabled, user.shopping_reminder_weekday)
+    new_enabled, new_weekday = shopping_cycle_from_state(state + delta)
+    await set_shopping_reminder_schedule(callback.from_user.id, new_enabled, new_weekday)
     await _render_shprmd_screen(callback)
 
 
 @router.callback_query(F.data == "shprmd_toggle")
 async def shprmd_toggle(callback: CallbackQuery) -> None:
+    """Оставлен ради обратной совместимости со старым экраном (отдельный
+    тумблер ☑️/◻️) — новый экран использует shprmd_cycle выше."""
     await toggle_shopping_reminder_enabled(callback.from_user.id)
     await _render_shprmd_screen(callback, "Обновлено ✅")
 
 
 @router.callback_query(F.data.startswith("shday_set:"))
 async def shprmd_day(callback: CallbackQuery) -> None:
-    """Выбор дня недели (радио-кнопки Пн–Вс, см.
+    """Оставлен ради обратной совместимости со старым экраном (отдельные
+    радио-кнопки Пн–Вс) — новый экран использует shprmd_cycle выше (см.
     database.requests.set_shopping_reminder_weekday)."""
     weekday = int(callback.data.split(":", maxsplit=1)[1])
     await set_shopping_reminder_weekday(callback.from_user.id, weekday)

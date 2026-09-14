@@ -764,6 +764,29 @@ async def set_shopping_reminder_weekday(user_id: int, weekday: int) -> bool:
         return True
 
 
+async def set_shopping_reminder_schedule(user_id: int, enabled: bool, weekday: int) -> bool:
+    """
+    Устанавливает СРАЗУ и включённость, и день недели одним запросом — для
+    компактного экрана "🛒 Напоминание о покупках" (см.
+    keyboards.shopping_reminder_screen_keyboard/handlers/profile.py::
+    shprmd_cycle), где "Выкл" — это ПЕРВОЕ значение в общей карусели
+    ◀️/▶️ вместе с днями недели (Выкл · Пн · Вт · ... · Вс), а не отдельный
+    переключатель — так один тап по стрелке одновременно меняет и то, и
+    другое, без двух раздельных действий (см. toggle_shopping_reminder_enabled/
+    set_shopping_reminder_weekday выше — те остаются ради обратной
+    совместимости со старым, отдельным экраном, но новый экран ими уже не
+    пользуется).
+    """
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return False
+        user.shopping_reminder_enabled = enabled
+        user.shopping_reminder_weekday = weekday % 7
+        await session.commit()
+        return True
+
+
 async def adjust_shopping_reminder_time(user_id: int, delta_minutes: int) -> int | None:
     """Степпер времени напоминания про покупки (см.
     User.shopping_reminder_time_minutes, handlers/profile.py::shprmdtime_adjust)."""
